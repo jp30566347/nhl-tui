@@ -1,0 +1,37 @@
+[package]
+name = "nhl-tui"
+version = "0.1.0"
+edition = "2021"
+description = "NHL scores and stats in your terminal"
+license = "MIT"
+repository = "https://github.com/jp30566347/nhl-tui"
+homepage = "https://github.com/jp30566347/nhl-tui"
+readme = "README.md"
+keywords = ["nhl", "hockey", "tui", "terminal", "scores"]
+categories = ["command-line-utilities"]
+exclude = [".github/"]
+
+[[bin]]
+name = "nhl-tui"
+path = "src/main.rs"
+doc = false
+
+[profile.release]
+lto = true
+strip = "symbols"
+opt-level = 3
+codegen-units = 1
+
+[dependencies]
+ratatui = { version = "0.30", features = ["crossterm"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+color-eyre = "0.6"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+unicode-width = "0.2"
