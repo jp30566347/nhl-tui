@@ -84,7 +84,7 @@ reported as an error rather than silently ignored.
 
 | Tab | Contents |
 |-----|----------|
-| Scores | One day's games, with live period and clock. `Enter` opens the boxscore: line score, shots, scoring with assists, penalties, and three stars. |
+| Scores | One day's games, with live period and clock. `Enter` opens the boxscore: goals and shots by period, scoring with assists, penalties, three stars, and a team stat comparison. |
 | Standings | Wild Card (division top threes, the two wild cards, and the playoff cut line), Conference, Division, or League. `●` marks a playoff spot. |
 | Schedule | The game week around the current date. |
 | Skaters | Points, goals, assists, +/-, PIM, PP and SH goals, faceoff %, TOI. |

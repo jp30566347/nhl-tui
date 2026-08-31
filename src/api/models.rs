@@ -184,18 +184,74 @@ pub struct BoxscoreResponse {
     pub summary: Option<Summary>,
 }
 
-/// The `/boxscore` endpoint, which is where shots on goal live; the
-/// `/landing` one above carries the scoring and penalty summaries.
-#[derive(Debug, Deserialize, Clone)]
+/// The `/right-rail` endpoint: goals and shots broken out by period, plus the
+/// team stat comparison. The `/landing` endpoint above carries the scoring and
+/// penalty summaries but none of this.
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GameStats {
-    pub away_team: TeamStats,
-    pub home_team: TeamStats,
+    pub linescore: Option<Linescore>,
+    #[serde(default)]
+    pub shots_by_period: Vec<PeriodCount>,
+    #[serde(default)]
+    pub team_game_stats: Vec<TeamStat>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct TeamStats {
-    pub sog: Option<u32>,
+#[serde(rename_all = "camelCase")]
+pub struct Linescore {
+    #[serde(default)]
+    pub by_period: Vec<PeriodCount>,
+}
+
+/// One period's worth of a per-side count, used for both goals and shots.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PeriodCount {
+    pub period_descriptor: PeriodDescriptor,
+    pub away: u32,
+    pub home: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamStat {
+    pub category: String,
+    /// Mixed: a plain number for shots, a string like "22/49" for faceoffs.
+    pub away_value: serde_json::Value,
+    pub home_value: serde_json::Value,
+}
+
+impl TeamStat {
+    /// The label to show, or `None` for categories deliberately not rendered
+    /// (the percentage variants duplicate the raw counts beside them).
+    pub fn label(&self) -> Option<&'static str> {
+        Some(match self.category.as_str() {
+            "sog" => "Shots",
+            "faceoffWins" => "Faceoffs",
+            "powerPlay" => "Power play",
+            "pim" => "PIM",
+            "hits" => "Hits",
+            "blockedShots" => "Blocks",
+            "giveaways" => "Giveaways",
+            "takeaways" => "Takeaways",
+            _ => return None,
+        })
+    }
+}
+
+/// Renders a mixed number-or-string stat value.
+pub fn stat_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => match n.as_f64() {
+            // Whole numbers are counts; anything fractional is a rate.
+            Some(f) if f.fract() == 0.0 => format!("{}", f as i64),
+            Some(f) => format!("{:.1}%", f * 100.0),
+            None => n.to_string(),
+        },
+        _ => String::new(),
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -331,5 +387,58 @@ mod tests {
             serde_json::from_str(r#"{ "lastName": {"default": "Giroux"}, "value": 0.630788 }"#)
                 .expect("float value should parse");
         assert_eq!(float.value, Some(0.630788));
+    }
+}
+
+#[cfg(test)]
+mod right_rail_tests {
+    use super::*;
+
+    /// Trimmed from a real `/right-rail` response.
+    const SAMPLE: &str = r#"{
+        "linescore": {
+            "byPeriod": [
+                {"periodDescriptor": {"number": 1, "periodType": "REG"}, "away": 0, "home": 0},
+                {"periodDescriptor": {"number": 4, "periodType": "OT"}, "away": 0, "home": 1}
+            ],
+            "totals": {"away": 1, "home": 2}
+        },
+        "shotsByPeriod": [
+            {"periodDescriptor": {"number": 1, "periodType": "REG"}, "away": 5, "home": 3},
+            {"periodDescriptor": {"number": 4, "periodType": "OT"}, "away": 0, "home": 1}
+        ],
+        "teamGameStats": [
+            {"category": "sog", "awayValue": 16, "homeValue": 23},
+            {"category": "faceoffWins", "awayValue": "22/49", "homeValue": "27/49"},
+            {"category": "powerPlayPctg", "awayValue": 0.0, "homeValue": 0.0}
+        ],
+        "gameInfo": {"referees": []},
+        "seasonSeries": []
+    }"#;
+
+    #[test]
+    fn right_rail_parses() {
+        let stats: GameStats = serde_json::from_str(SAMPLE).expect("right-rail should parse");
+        assert_eq!(stats.shots_by_period.len(), 2);
+        assert_eq!(stats.shots_by_period[1].home, 1);
+        assert_eq!(stats.linescore.as_ref().map(|l| l.by_period.len()), Some(2));
+        assert_eq!(stats.team_game_stats.len(), 3);
+    }
+
+    #[test]
+    fn stat_values_render_counts_strings_and_rates() {
+        let stats: GameStats = serde_json::from_str(SAMPLE).unwrap();
+        let by = |name: &str| {
+            let s = stats
+                .team_game_stats
+                .iter()
+                .find(|s| s.category == name)
+                .unwrap();
+            stat_value(&s.away_value)
+        };
+        assert_eq!(by("sog"), "16");
+        assert_eq!(by("faceoffWins"), "22/49");
+        // Percentage categories are not rendered, but must not panic.
+        assert_eq!(by("powerPlayPctg"), "0");
     }
 }
