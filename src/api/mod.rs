@@ -107,6 +107,15 @@ impl NhlClient {
         .await
     }
 
+    /// Shots on goal, which the landing endpoint does not carry.
+    pub async fn get_game_stats(&self, game_id: u64) -> Result<GameStats> {
+        self.get_json(
+            &format!("{BASE_URL}/gamecenter/{game_id}/boxscore"),
+            "game stats",
+        )
+        .await
+    }
+
     pub async fn get_boxscore(&self, game_id: u64) -> Result<BoxscoreResponse> {
         self.get_json(
             &format!("{BASE_URL}/gamecenter/{game_id}/landing"),

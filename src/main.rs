@@ -1,6 +1,7 @@
 mod action;
 mod api;
 mod app;
+mod config;
 mod tui;
 mod ui;
 
@@ -21,8 +22,16 @@ struct Cli {
     /// Starting tab (1=Scores, 2=Standings, 3=Schedule, 4=Skaters, 5=Goalies)
     ///
     /// No short form: `-t` belongs to `--team`.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=5))]
-    tab: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    tab: Option<u8>,
+
+    /// Write the given --team and --tab to the config file and exit
+    #[arg(long)]
+    save_config: bool,
+
+    /// Ignore the config file
+    #[arg(long)]
+    no_config: bool,
 }
 
 /// Restores the terminal before a panic or error report is printed, so the
@@ -48,9 +57,28 @@ fn install_hooks() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Command line beats config file, which beats the built-in default.
+    let stored = if cli.no_config {
+        config::Config::default()
+    } else {
+        config::Config::load()?
+    };
+    let settings = config::Config {
+        team: cli.team.clone().or(stored.team),
+        tab: cli.tab.or(stored.tab),
+    };
+
+    if cli.save_config {
+        let path = settings.save()?;
+        println!("Wrote {}", path.display());
+        return Ok(());
+    }
+
     install_hooks()?;
 
-    let mut app = app::App::new(cli.team, usize::from(cli.tab - 1));
+    let tab = usize::from(settings.tab.unwrap_or(1).clamp(1, 5) - 1);
+    let mut app = app::App::new(settings.team, tab);
     let mut tui = tui::Tui::new()?;
 
     tui.run(&mut app).await
