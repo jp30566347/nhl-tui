@@ -43,15 +43,18 @@ nhl-tui --tab 2            # Open standings tab (1=Scores, 2=Standings, 3=Schedu
 | Key | Action |
 |-----|--------|
 | `1` `2` `3` `4` | Switch tabs |
-| `h` `j` `k` `l` / arrows | Navigate |
+| `h` `l` / `←` `→` | Previous/next day (Scores, Schedule), or cycle the filter (Standings, Leaders) |
+| `j` `k` / `↓` `↑` | Move the selection |
+| `g` `G` / `Home` `End` | Jump to first/last row |
 | `Enter` | Open game boxscore |
-| `r` | Refresh data |
-| `Esc` | Close boxscore |
-| `q` | Quit |
+| `r` | Refresh now |
+| `Esc` | Close boxscore, or quit |
+| `q` / `Ctrl-C` | Quit |
 
 ## Data
 
-Scores and stats refresh automatically every 30 seconds from the [NHL API](https://api-web.nhle.com).
+Scores and stats refresh automatically every 30 seconds from the [NHL API](https://api-web.nhle.com),
+in the background so the interface stays responsive while requests are in flight.
 
 ## License
 

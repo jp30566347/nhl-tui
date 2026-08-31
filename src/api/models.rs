@@ -9,18 +9,21 @@ pub struct ScoreResponse {
 #[serde(rename_all = "camelCase")]
 pub struct Game {
     pub id: u64,
+    /// The API spells this `startTimeUTC`, which `rename_all = "camelCase"`
+    /// would otherwise map to `startTimeUtc` and silently leave as `None`.
+    #[serde(rename = "startTimeUTC")]
     pub start_time_utc: Option<String>,
     pub game_state: String,
     pub away_team: TeamScore,
     pub home_team: TeamScore,
     pub game_outcome: Option<GameOutcome>,
     pub period: Option<u32>,
+    pub period_descriptor: Option<PeriodDescriptor>,
     pub clock: Option<GameClock>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TeamScore {
-    pub name: Option<TeamName>,
     pub abbrev: String,
     pub score: Option<u32>,
 }
@@ -46,7 +49,23 @@ pub struct GameClock {
 #[serde(rename_all = "camelCase")]
 pub struct PeriodDescriptor {
     pub number: u32,
-    pub period_type: String,
+    pub period_type: Option<String>,
+}
+
+impl PeriodDescriptor {
+    /// "1st", "2nd", "3rd", "OT", "2OT", "SO".
+    pub fn label(&self) -> String {
+        match self.period_type.as_deref() {
+            Some("SO") => "SO".to_string(),
+            _ => match self.number {
+                1 => "1st".to_string(),
+                2 => "2nd".to_string(),
+                3 => "3rd".to_string(),
+                4 => "OT".to_string(),
+                n => format!("{}OT", n - 3),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -92,14 +111,12 @@ pub struct ScheduleResponse {
 pub struct GameDay {
     pub date: String,
     pub day_abbrev: String,
-    pub number_of_games: u32,
     pub games: Vec<ScheduleGame>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleGame {
-    pub id: u64,
     #[serde(rename = "startTimeUTC")]
     pub start_time_utc: String,
     pub away_team: ScheduleTeam,
@@ -111,19 +128,17 @@ pub struct ScheduleGame {
 pub struct ScheduleTeam {
     pub abbrev: String,
     pub place_name: Option<TeamName>,
-    pub common_name: Option<TeamName>,
-    pub score: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct StatLeader {
-    pub id: u32,
     pub first_name: Option<NameField>,
     pub last_name: Option<NameField>,
     pub position: Option<String>,
     pub team_abbrev: Option<String>,
-    pub value: Option<serde_json::Value>,
+    /// Integer for counting stats, fractional for faceoff % and time on ice.
+    pub value: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -134,11 +149,8 @@ pub struct NameField {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BoxscoreResponse {
-    pub id: u64,
-    pub game_state: String,
     pub away_team: BoxscoreTeam,
     pub home_team: BoxscoreTeam,
-    pub clock: Option<GameClock>,
     pub summary: Option<Summary>,
 }
 
@@ -149,7 +161,6 @@ pub struct Summary {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct BoxscoreTeam {
-    pub id: u32,
     pub abbrev: String,
     pub name: Option<TeamName>,
     pub score: Option<u32>,
@@ -166,18 +177,12 @@ pub struct ScoringPeriod {
 #[serde(rename_all = "camelCase")]
 pub struct Goal {
     pub time_in_period: String,
-    pub team_abbrev: AbbrevField,
+    pub team_abbrev: NameField,
     pub first_name: Option<NameField>,
     pub last_name: Option<NameField>,
-    pub goal_modifier: Option<String>,
     pub strength: Option<String>,
     pub assists: Vec<Assist>,
     pub goals_to_date: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct AbbrevField {
-    pub default: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -186,4 +191,62 @@ pub struct Assist {
     pub first_name: Option<NameField>,
     pub last_name: Option<NameField>,
     pub assists_to_date: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live endpoint spells this field `startTimeUTC`. Under a plain
+    /// `rename_all = "camelCase"` it silently deserialized as `None` and every
+    /// upcoming game rendered as "TBD".
+    #[test]
+    fn game_parses_the_uppercase_start_time_field() {
+        let json = r#"{
+            "id": 2025021000,
+            "startTimeUTC": "2026-03-10T23:00:00Z",
+            "gameState": "FUT",
+            "awayTeam": { "abbrev": "TOR", "score": 0 },
+            "homeTeam": { "abbrev": "MTL", "score": 0 },
+            "periodDescriptor": { "number": 4, "periodType": "OT" },
+            "gameOutcome": { "lastPeriodType": "OT" }
+        }"#;
+        let game: Game = serde_json::from_str(json).expect("game should parse");
+        assert_eq!(game.start_time_utc.as_deref(), Some("2026-03-10T23:00:00Z"));
+        assert_eq!(
+            game.period_descriptor.map(|p| p.label()).as_deref(),
+            Some("OT")
+        );
+    }
+
+    /// Optional fields the score endpoint omits for scheduled games must not
+    /// fail the whole response.
+    #[test]
+    fn game_tolerates_missing_optional_fields() {
+        let json = r#"{
+            "id": 1,
+            "gameState": "FUT",
+            "awayTeam": { "abbrev": "TOR" },
+            "homeTeam": { "abbrev": "MTL" }
+        }"#;
+        let game: Game = serde_json::from_str(json).expect("sparse game should parse");
+        assert!(game.start_time_utc.is_none());
+        assert!(game.clock.is_none());
+        assert!(game.away_team.score.is_none());
+    }
+
+    /// Counting stats come back as integers and faceoff/TOI as floats; both
+    /// have to land in the same field.
+    #[test]
+    fn stat_leader_value_accepts_integers_and_floats() {
+        let int: StatLeader =
+            serde_json::from_str(r#"{ "firstName": {"default": "Connor"}, "value": 138 }"#)
+                .expect("integer value should parse");
+        assert_eq!(int.value, Some(138.0));
+
+        let float: StatLeader =
+            serde_json::from_str(r#"{ "lastName": {"default": "Giroux"}, "value": 0.630788 }"#)
+                .expect("float value should parse");
+        assert_eq!(float.value, Some(0.630788));
+    }
 }
