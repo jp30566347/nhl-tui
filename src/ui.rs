@@ -699,56 +699,19 @@ fn draw_boxscore_overlay(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            // Header plus a goals and a shots row per side.
             Constraint::Length(5),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
         .split(inner);
 
+    // Goals and shots per period, straight from the API rather than derived by
+    // counting the scoring summary: that mis-bucketed anything past the first
+    // overtime and counted a shootout decider as a regulation goal.
+    f.render_widget(Paragraph::new(line_score(app, away, home)), chunks[0]);
+
     let scoring = boxscore.summary.as_ref().and_then(|s| s.scoring.as_ref());
-
-    let mut period_lines = vec![Line::from(vec![
-        Span::raw("        "),
-        Span::styled("1st   2nd   3rd   OT    Total", Style::new().bold()),
-    ])];
-
-    if let Some(periods) = scoring {
-        let (mut away_goals, mut home_goals) = ([0u32; 4], [0u32; 4]);
-        for period in periods {
-            let idx = (period.period_descriptor.number as usize).clamp(1, 4) - 1;
-            for goal in &period.goals {
-                if goal.team_abbrev.default == away.abbrev {
-                    away_goals[idx] += 1;
-                } else {
-                    home_goals[idx] += 1;
-                }
-            }
-        }
-        let row = |abbrev: &str, goals: &[u32; 4]| {
-            Line::from(vec![
-                Span::styled(format!("{abbrev:<8}"), Style::new().bold()),
-                Span::raw(format!(
-                    "{:<5} {:<5} {:<5} {:<5} {}",
-                    goals[0],
-                    goals[1],
-                    goals[2],
-                    goals[3],
-                    goals.iter().sum::<u32>()
-                )),
-            ])
-        };
-        period_lines.push(row(&away.abbrev, &away_goals));
-        period_lines.push(row(&home.abbrev, &home_goals));
-    }
-    if let Some(stats) = &app.game_stats {
-        if let (Some(away_sog), Some(home_sog)) = (stats.away_team.sog, stats.home_team.sog) {
-            period_lines.push(Line::from(vec![
-                Span::styled("Shots   ", MUTED),
-                Span::raw(format!("{away_sog} - {home_sog}")),
-            ]));
-        }
-    }
-    f.render_widget(Paragraph::new(period_lines), chunks[0]);
 
     let mut goal_lines = vec![Line::styled("   Goals:", Style::new().bold())];
     if let Some(periods) = scoring {
@@ -887,6 +850,8 @@ fn draw_boxscore_overlay(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    goal_lines.extend(team_stats_lines(app, &away.abbrev, &home.abbrev));
+
     // A high-scoring game produces more goals than fit, so the list scrolls.
     // The offset is clamped here rather than in the key handler, which has no
     // idea how tall the overlay is.
@@ -987,6 +952,114 @@ fn centered_size(width: u16, height: u16, area: Rect) -> Rect {
         width,
         height,
     }
+}
+
+/// The per-period grid: a goals row and a shots row per side, with a column
+/// for every period the game actually reached.
+fn line_score(
+    app: &App,
+    away: &crate::api::models::BoxscoreTeam,
+    home: &crate::api::models::BoxscoreTeam,
+) -> Vec<Line<'static>> {
+    use crate::api::models::PeriodCount;
+
+    let stats = app.game_stats.as_ref();
+    let goals: &[PeriodCount] = stats
+        .and_then(|s| s.linescore.as_ref())
+        .map(|l| l.by_period.as_slice())
+        .unwrap_or(&[]);
+    let shots: &[PeriodCount] = stats.map(|s| s.shots_by_period.as_slice()).unwrap_or(&[]);
+
+    // Periods come from whichever series is longer, so a game still in the
+    // first period shows one column rather than a row of empty ones.
+    let source = if goals.len() >= shots.len() {
+        goals
+    } else {
+        shots
+    };
+    if source.is_empty() {
+        return Vec::new();
+    }
+
+    let mut header = vec![Span::raw(format!("{:<9}", ""))];
+    for period in source {
+        header.push(Span::styled(
+            format!("{:<6}", period.period_descriptor.label()),
+            Style::new().bold(),
+        ));
+    }
+    header.push(Span::styled("Total", Style::new().bold()));
+    let mut lines = vec![Line::from(header)];
+
+    let mut side = |abbrev: &str,
+                    label: &str,
+                    counts: &[PeriodCount],
+                    pick: fn(&PeriodCount) -> u32,
+                    total: Option<u32>| {
+        let mut spans = vec![
+            Span::styled(format!("{abbrev:<5}"), Style::new().bold()),
+            Span::styled(format!("{label:<4}"), MUTED),
+        ];
+        let mut sum = 0;
+        for period in source {
+            let value = counts
+                .iter()
+                .find(|c| c.period_descriptor.number == period.period_descriptor.number)
+                .map(pick);
+            sum += value.unwrap_or(0);
+            spans.push(Span::raw(format!(
+                "{:<6}",
+                value.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+            )));
+        }
+        spans.push(Span::styled(
+            total.unwrap_or(sum).to_string(),
+            Style::new().bold(),
+        ));
+        lines.push(Line::from(spans));
+    };
+
+    side(&away.abbrev, "G", goals, |c| c.away, away.score);
+    side(&away.abbrev, "SOG", shots, |c| c.away, None);
+    side(&home.abbrev, "G", goals, |c| c.home, home.score);
+    side(&home.abbrev, "SOG", shots, |c| c.home, None);
+    lines
+}
+
+/// The team stat comparison, appended below the scoring and penalty summaries.
+fn team_stats_lines(app: &App, away: &str, home: &str) -> Vec<Line<'static>> {
+    let Some(stats) = app.game_stats.as_ref() else {
+        return Vec::new();
+    };
+    let rows: Vec<_> = stats
+        .team_game_stats
+        .iter()
+        .filter_map(|stat| stat.label().map(|label| (label, stat)))
+        .collect();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled("   Team stats:", Style::new().bold()),
+        Line::from(vec![
+            Span::raw(format!("   {:<14}", "")),
+            Span::styled(format!("{away:<8}"), Style::new().bold()),
+            Span::styled(home.to_string(), Style::new().bold()),
+        ]),
+    ];
+    for (label, stat) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {label:<14}"), MUTED),
+            Span::raw(format!(
+                "{:<8}",
+                crate::api::models::stat_value(&stat.away_value)
+            )),
+            Span::raw(crate::api::models::stat_value(&stat.home_value)),
+        ]));
+    }
+    lines
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

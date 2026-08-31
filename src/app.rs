@@ -253,7 +253,7 @@ pub struct Fetched {
     pub leaders: Option<Result<HashMap<String, Vec<StatLeader>>, String>>,
     pub goalies: Option<Result<HashMap<String, Vec<StatLeader>>, String>>,
     pub boxscore: Option<Result<BoxscoreResponse, String>>,
-    pub game_stats: Option<GameStats>,
+    pub game_stats: Option<Result<GameStats, String>>,
 }
 
 /// Which feeds a given refresh should actually request.
@@ -852,12 +852,15 @@ impl App {
                 feed!(plan.leaders, client.get_skater_leaders(LEADER_LIMIT)),
                 feed!(plan.leaders, client.get_goalie_leaders(LEADER_LIMIT)),
             );
-            // Shots on goal come from a second, smaller endpoint, and only
-            // while the overlay is actually open.
+            // Per-period goals and shots come from a second, smaller
+            // endpoint, and only while the overlay is actually open.
             let (boxscore, game_stats) = match boxscore_id {
                 Some(id) => {
                     let (b, g) = tokio::join!(client.get_boxscore(id), client.get_game_stats(id));
-                    (Some(b.map_err(|e| e.to_string())), g.ok())
+                    (
+                        Some(b.map_err(|e| e.to_string())),
+                        Some(g.map_err(|e| e.to_string())),
+                    )
                 }
                 None => (None, None),
             };
@@ -922,8 +925,10 @@ impl App {
             Some(Err(e)) => errors.push(e),
             None => {}
         }
-        if fetched.game_stats.is_some() {
-            self.game_stats = fetched.game_stats;
+        match fetched.game_stats {
+            Some(Ok(stats)) => self.game_stats = Some(stats),
+            Some(Err(e)) => errors.push(e),
+            None => {}
         }
 
         self.error = errors.first().cloned();
