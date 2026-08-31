@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::time::Duration;
 
 use color_eyre::eyre::Result;
@@ -10,22 +11,36 @@ use crate::action::Action;
 use crate::app::App;
 use crate::ui;
 
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+type Backend = ratatui::backend::CrosstermBackend<std::io::Stderr>;
+
 pub struct Tui {
-    pub terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stderr>>,
+    terminal: ratatui::Terminal<Backend>,
     task: tokio::task::JoinHandle<()>,
     cancellation_token: CancellationToken,
     action_rx: mpsc::UnboundedReceiver<Action>,
     action_tx: mpsc::UnboundedSender<Action>,
-    frame_rate: f64,
-    tick_rate: f64,
-    refresh_interval: Duration,
+}
+
+/// Puts the terminal back the way we found it.
+///
+/// Safe to call more than once, and callable from a panic hook, which is why
+/// it is a free function rather than a method on `Tui`.
+pub fn restore() -> Result<()> {
+    crossterm::execute!(
+        std::io::stderr(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    crossterm::terminal::disable_raw_mode()?;
+    Ok(())
 }
 
 impl Tui {
     pub fn new() -> Result<Self> {
-        let terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
-            std::io::stderr(),
-        ))?;
+        let terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stderr()))?;
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         Ok(Self {
             terminal,
@@ -33,16 +48,10 @@ impl Tui {
             cancellation_token: CancellationToken::new(),
             action_rx,
             action_tx,
-            frame_rate: 30.0,
-            tick_rate: 4.0,
-            refresh_interval: Duration::from_secs(30),
         })
     }
 
-    pub fn start(&mut self) {
-        let tick_delay = Duration::from_secs_f64(1.0 / self.tick_rate);
-        let render_delay = Duration::from_secs_f64(1.0 / self.frame_rate);
-        let refresh_delay = self.refresh_interval;
+    fn start(&mut self) {
         self.cancel();
         self.cancellation_token = CancellationToken::new();
         let cancellation_token = self.cancellation_token.clone();
@@ -50,36 +59,39 @@ impl Tui {
 
         self.task = tokio::spawn(async move {
             let mut reader = EventStream::new();
-            let mut tick_interval = tokio::time::interval(tick_delay);
-            let mut render_interval = tokio::time::interval(render_delay);
-            let mut refresh_interval = tokio::time::interval(refresh_delay);
+            let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
+            // The first tick of an interval completes immediately; the initial
+            // fetch is issued by `run`, so skip it.
+            refresh.tick().await;
 
             loop {
-                let tick_delay = tick_interval.tick();
-                let render_delay = render_interval.tick();
-                let refresh_tick = refresh_interval.tick();
-                let crossterm_event = reader.next().fuse();
-
                 tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        break;
-                    }
-                    maybe_event = crossterm_event => {
-                        if let Some(Ok(CrosstermEvent::Key(key))) = maybe_event {
-                            if key.kind == KeyEventKind::Press {
-                                let _ = action_tx.send(Action::Key(key));
+                    _ = cancellation_token.cancelled() => break,
+                    maybe_event = reader.next().fuse() => {
+                        match maybe_event {
+                            Some(Ok(CrosstermEvent::Key(key)))
+                                if key.kind == KeyEventKind::Press =>
+                            {
+                                if action_tx.send(Action::Key(key)).is_err() {
+                                    break;
+                                }
                             }
+                            // A resize invalidates the whole screen.
+                            Some(Ok(CrosstermEvent::Resize(_, _))) => {
+                                if action_tx.send(Action::Render).is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Ok(_)) => {}
+                            // stdin closed or broke: nothing more will arrive.
+                            Some(Err(_)) | None => break,
                         }
-                    },
-                    _ = tick_delay => {
-                        let _ = action_tx.send(Action::Tick);
-                    },
-                    _ = render_delay => {
-                        let _ = action_tx.send(Action::Render);
-                    },
-                    _ = refresh_tick => {
-                        let _ = action_tx.send(Action::Tick);
-                    },
+                    }
+                    _ = refresh.tick() => {
+                        if action_tx.send(Action::Refresh).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -89,25 +101,17 @@ impl Tui {
         self.cancellation_token.cancel();
     }
 
-    pub fn enter(&mut self) -> Result<()> {
+    fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
+        // Mouse capture is deliberately not enabled: nothing here handles
+        // mouse events, and turning it on breaks click-to-select in the
+        // host terminal.
         crossterm::execute!(
             std::io::stderr(),
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture
+            crossterm::cursor::Hide
         )?;
         self.terminal.clear()?;
-        Ok(())
-    }
-
-    pub fn exit(&mut self) -> Result<()> {
-        self.cancel();
-        crossterm::execute!(
-            std::io::stderr(),
-            crossterm::event::DisableMouseCapture,
-            crossterm::terminal::LeaveAlternateScreen
-        )?;
-        crossterm::terminal::disable_raw_mode()?;
         Ok(())
     }
 
@@ -115,36 +119,61 @@ impl Tui {
         self.enter()?;
         self.start();
 
-        // Initial data fetch
-        app.fetch_all().await;
+        // Restore the terminal even if the loop fails, so an error is
+        // readable instead of being printed into the alternate screen.
+        let result = self.event_loop(app).await;
+        self.cancel();
+        restore()?;
+        result
+    }
 
-        loop {
-            if let Some(action) = self.action_rx.recv().await {
-                match action {
-                    Action::Render => {
-                        self.terminal.draw(|f| ui::draw(f, app))?;
+    async fn event_loop(&mut self, app: &mut App) -> Result<()> {
+        app.spawn_fetch(self.action_tx.clone());
+        self.draw(app)?;
+
+        while let Some(action) = self.action_rx.recv().await {
+            match action {
+                Action::Render => {}
+                Action::Refresh => app.spawn_fetch(self.action_tx.clone()),
+                Action::Fetched(fetched) => {
+                    if app.apply_fetch(*fetched) {
+                        bell();
                     }
-                    Action::Tick => {
-                        app.fetch_all().await;
-                        if app.check_score_alerts() {
-                            eprint!("\x07");
-                        }
+                }
+                Action::Key(key) => {
+                    if let Some(next) = app.handle_key(key) {
+                        // The channel is only closed once we drop it.
+                        let _ = self.action_tx.send(next);
                     }
-                    Action::Key(key) => {
-                        if let Some(a) = app.handle_key(key).await {
-                            let _ = self.action_tx.send(a);
-                        }
-                    }
-                    _ => {}
                 }
             }
 
             if app.should_quit {
                 break;
             }
+            // Every action either changed state or asked for a redraw.
+            self.draw(app)?;
         }
-
-        self.exit()?;
         Ok(())
     }
+
+    fn draw(&mut self, app: &App) -> Result<()> {
+        self.terminal.draw(|frame| ui::draw(frame, app))?;
+        Ok(())
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        self.cancel();
+        self.task.abort();
+    }
+}
+
+/// Rings the terminal bell. Written straight to the terminal because it is
+/// not something that can live in a ratatui cell buffer.
+fn bell() {
+    let mut stderr = std::io::stderr();
+    let _ = stderr.write_all(b"\x07");
+    let _ = stderr.flush();
 }
