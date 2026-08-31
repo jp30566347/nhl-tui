@@ -95,6 +95,29 @@ pub struct Standing {
     pub division_sequence: Option<u32>,
     pub conference_sequence: Option<u32>,
     pub league_sequence: Option<u32>,
+    pub point_pctg: Option<f64>,
+    pub l10_wins: Option<u32>,
+    pub l10_losses: Option<u32>,
+    pub l10_ot_losses: Option<u32>,
+    /// 0 for a team holding a top-three spot in its division; 1 and 2 are the
+    /// two wild card berths; 3 and up are outside the playoff picture.
+    pub wildcard_sequence: Option<u32>,
+}
+
+impl Standing {
+    /// Whether the team currently holds a playoff berth: a divisional top
+    /// three, or one of the conference's two wild cards.
+    pub fn in_playoff_spot(&self) -> bool {
+        matches!(self.wildcard_sequence, Some(0..=2))
+    }
+
+    /// Record over the last ten games, as "W-L-OTL".
+    pub fn last_ten(&self) -> Option<String> {
+        Some(format!(
+            "{}-{}-{}",
+            self.l10_wins?, self.l10_losses?, self.l10_ot_losses?
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -106,6 +129,11 @@ pub struct TeamAbbrev {
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleResponse {
     pub game_week: Vec<GameDay>,
+    /// Nearest dates on either side that actually have games, and the season
+    /// boundaries. These are what make an empty week actionable.
+    pub next_start_date: Option<String>,
+    pub previous_start_date: Option<String>,
+    pub regular_season_start_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -156,9 +184,62 @@ pub struct BoxscoreResponse {
     pub summary: Option<Summary>,
 }
 
+/// The `/boxscore` endpoint, which is where shots on goal live; the
+/// `/landing` one above carries the scoring and penalty summaries.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GameStats {
+    pub away_team: TeamStats,
+    pub home_team: TeamStats,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TeamStats {
+    pub sog: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Summary {
     pub scoring: Option<Vec<ScoringPeriod>>,
+    pub penalties: Option<Vec<PenaltyPeriod>>,
+    pub three_stars: Option<Vec<ThreeStar>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PenaltyPeriod {
+    pub period_descriptor: PeriodDescriptor,
+    pub penalties: Vec<Penalty>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Penalty {
+    pub time_in_period: String,
+    pub duration: Option<u32>,
+    pub committed_by_player: Option<PlayerName>,
+    pub team_abbrev: Option<NameField>,
+    /// A slug such as "interference"; rendered with the underscores removed.
+    pub desc_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerName {
+    pub first_name: Option<NameField>,
+    pub last_name: Option<NameField>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreeStar {
+    pub star: u32,
+    pub name: Option<NameField>,
+    pub team_abbrev: Option<String>,
+    pub position: Option<String>,
+    pub goals: Option<u32>,
+    pub assists: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -54,11 +54,43 @@ Press `?` in the app for this list.
 | `h` `l` / `←` `→` | Previous/next day (Scores, Schedule), or cycle category |
 | `H` / `L` | Jump back / forward one week |
 | `t` | Back to today |
+| `n` / `p` | Next / previous day with games |
+| `d` | Go to a specific date |
 | `Enter` | Open the boxscore (Scores tab) |
 | `r` | Refresh everything now |
 | `?` | Toggle help |
 | `Esc` | Close an overlay |
 | `q` / `Ctrl-C` | Quit |
+
+## Configuration
+
+Optional, so `--team` need not be retyped. Write the current options with:
+
+```sh
+nhl-tui --team TOR --tab 2 --save-config
+```
+
+That creates `~/.config/nhl-tui/config.toml`:
+
+```toml
+team = "TOR"
+tab = 2
+```
+
+Command-line flags override the file; `--no-config` ignores it entirely. An unknown key is
+reported as an error rather than silently ignored.
+
+## Tabs
+
+| Tab | Contents |
+|-----|----------|
+| Scores | One day's games, with live period and clock. `Enter` opens the boxscore: line score, shots, scoring with assists, penalties, and three stars. |
+| Standings | Wild Card (division top threes, the two wild cards, and the playoff cut line), Conference, Division, or League. `●` marks a playoff spot. |
+| Schedule | The game week around the current date. |
+| Skaters | Points, goals, assists, +/-, PIM, PP and SH goals, faceoff %, TOI. |
+| Goalies | Wins, GAA, save %, shutouts. |
+
+Standings columns adapt to the terminal width, dropping GA, GF, then +/- and streak as it narrows.
 
 ## Data
 

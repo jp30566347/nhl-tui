@@ -62,13 +62,17 @@ impl Tab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StandingsFilter {
+    /// Division top threes plus the two wild cards, the way playoff races are
+    /// normally read.
+    Wildcard,
     Conference,
     Division,
     League,
 }
 
 impl StandingsFilter {
-    pub const ALL: [StandingsFilter; 3] = [
+    pub const ALL: [StandingsFilter; 4] = [
+        StandingsFilter::Wildcard,
         StandingsFilter::Conference,
         StandingsFilter::Division,
         StandingsFilter::League,
@@ -84,6 +88,7 @@ impl StandingsFilter {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            StandingsFilter::Wildcard => "Wild Card",
             StandingsFilter::Conference => "Conference",
             StandingsFilter::Division => "Division",
             StandingsFilter::League => "League",
@@ -225,6 +230,10 @@ impl GoalieCategory {
     }
 }
 
+fn parse_date(text: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()
+}
+
 fn cycle<T: Copy + PartialEq>(all: &[T], current: T, step: isize) -> T {
     let len = all.len();
     let idx = all.iter().position(|v| *v == current).unwrap_or(0);
@@ -244,6 +253,7 @@ pub struct Fetched {
     pub leaders: Option<Result<HashMap<String, Vec<StatLeader>>, String>>,
     pub goalies: Option<Result<HashMap<String, Vec<StatLeader>>, String>>,
     pub boxscore: Option<Result<BoxscoreResponse, String>>,
+    pub game_stats: Option<GameStats>,
 }
 
 /// Which feeds a given refresh should actually request.
@@ -282,7 +292,10 @@ pub struct App {
     pub goalies_scroll: usize,
 
     pub show_boxscore: bool,
+    pub game_stats: Option<GameStats>,
     pub boxscore_scroll: usize,
+    /// Text typed into the "go to date" prompt, or `None` when it is closed.
+    pub date_input: Option<String>,
     pub show_help: bool,
     pub selected_game_id: Option<u64>,
 
@@ -324,7 +337,7 @@ impl App {
             leaders: HashMap::new(),
             goalies: HashMap::new(),
             boxscore: None,
-            standings_filter: StandingsFilter::Conference,
+            standings_filter: StandingsFilter::Wildcard,
             leader_category: LeaderCategory::Points,
             goalie_category: GoalieCategory::Wins,
             scores_scroll: 0,
@@ -333,7 +346,9 @@ impl App {
             leaders_scroll: 0,
             goalies_scroll: 0,
             show_boxscore: false,
+            game_stats: None,
             boxscore_scroll: 0,
+            date_input: None,
             show_help: false,
             selected_game_id: None,
             viewport_rows: Cell::new(20),
@@ -359,6 +374,33 @@ impl App {
             return None;
         }
 
+        // The date prompt is a text field, so it must claim ordinary
+        // characters before any of the single-key bindings below.
+        if let Some(input) = self.date_input.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.date_input = None,
+                KeyCode::Enter => {
+                    let parsed = NaiveDate::parse_from_str(input, "%Y-%m-%d");
+                    self.date_input = None;
+                    if let Ok(date) = parsed {
+                        self.current_date = date;
+                        self.reset_scroll();
+                        return Some(Action::Refresh);
+                    }
+                    self.error = Some("Could not read that date (expected YYYY-MM-DD)".into());
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                // Length caps at "YYYY-MM-DD".
+                KeyCode::Char(c) if (c.is_ascii_digit() || c == '-') && input.len() < 10 => {
+                    input.push(c)
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         // Overlays swallow input: Esc/q backs out of them rather than
         // quitting, which is what Esc means in most TUIs.
         if self.show_help {
@@ -375,6 +417,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
                     self.show_boxscore = false;
                     self.boxscore = None;
+                    self.game_stats = None;
                     self.boxscore_scroll = 0;
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.boxscore_scroll += 1,
@@ -389,6 +432,11 @@ impl App {
         }
 
         match key.code {
+            // Vim's half-page scroll. These are matched before the bare
+            // character bindings, or `d` would shadow Ctrl-D.
+            KeyCode::Char('u') if ctrl => self.move_selection(-(self.page() as isize) / 2),
+            KeyCode::Char('d') if ctrl => self.move_selection(self.page() as isize / 2),
+
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('r') => return Some(Action::ForceRefresh),
@@ -430,6 +478,19 @@ impl App {
             // holding a key down; `t` returns to today.
             KeyCode::Char('H') => return self.shift_date(-7),
             KeyCode::Char('L') => return self.shift_date(7),
+            // Jump to the nearest date that actually has games, which is what
+            // makes the app usable in the offseason.
+            KeyCode::Char('n') => {
+                if let Some(date) = self.next_game_day() {
+                    return self.goto(date);
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(date) = self.previous_game_day() {
+                    return self.goto(date);
+                }
+            }
+            KeyCode::Char('d') => self.date_input = Some(String::new()),
             KeyCode::Char('t') => {
                 let today = Local::now().date_naive();
                 if self.current_date != today {
@@ -443,9 +504,6 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-(self.page() as isize)),
             KeyCode::PageDown => self.move_selection(self.page() as isize),
-            // Vim's half-page scroll.
-            KeyCode::Char('u') if ctrl => self.move_selection(-(self.page() as isize) / 2),
-            KeyCode::Char('d') if ctrl => self.move_selection(self.page() as isize / 2),
             KeyCode::Home | KeyCode::Char('g') => *self.scroll_mut() = 0,
             KeyCode::End | KeyCode::Char('G') => {
                 let last = self.row_count().saturating_sub(1);
@@ -465,6 +523,33 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// The nearest day on either side of the current week that has games.
+    /// The schedule endpoint reports these, which is the only cheap way to
+    /// skip a long gap such as the offseason.
+    pub fn next_game_day(&self) -> Option<NaiveDate> {
+        parse_date(self.schedule.as_ref()?.next_start_date.as_deref()?)
+    }
+
+    pub fn previous_game_day(&self) -> Option<NaiveDate> {
+        parse_date(self.schedule.as_ref()?.previous_start_date.as_deref()?)
+    }
+
+    /// First day of the regular season, for the offseason placeholder.
+    pub fn regular_season_start(&self) -> Option<NaiveDate> {
+        parse_date(
+            self.schedule
+                .as_ref()?
+                .regular_season_start_date
+                .as_deref()?,
+        )
+    }
+
+    fn goto(&mut self, date: NaiveDate) -> Option<Action> {
+        self.current_date = date;
+        self.reset_scroll();
+        Some(Action::Refresh)
     }
 
     /// Moves the current date and asks for the data that goes with it.
@@ -570,6 +655,34 @@ impl App {
         };
         let mut rows: Vec<&Standing> = standings.iter().collect();
         match self.standings_filter {
+            // Conference, then the two divisions' top threes, then that
+            // conference's wild card race in order.
+            StandingsFilter::Wildcard => {
+                rows.sort_by(|a, b| {
+                    let key = |s: &Standing| {
+                        let wildcard = s.wildcard_sequence.unwrap_or(u32::MAX);
+                        // In a division top three, wildcard_sequence is 0, so
+                        // those group under the division; everyone else falls
+                        // into the shared wild card block.
+                        let in_division = wildcard == 0;
+                        (
+                            s.conference_name.clone(),
+                            !in_division,
+                            if in_division {
+                                s.division_name.clone()
+                            } else {
+                                String::new()
+                            },
+                            if in_division {
+                                s.division_sequence.unwrap_or(u32::MAX)
+                            } else {
+                                wildcard
+                            },
+                        )
+                    };
+                    key(a).cmp(&key(b))
+                });
+            }
             StandingsFilter::League => {
                 rows.sort_by_key(|s| s.league_sequence.unwrap_or(u32::MAX));
             }
@@ -605,7 +718,18 @@ impl App {
             StandingsFilter::Conference => Some(&standing.conference_name),
             StandingsFilter::Division => Some(&standing.division_name),
             StandingsFilter::League => None,
+            StandingsFilter::Wildcard => Some(if standing.wildcard_sequence == Some(0) {
+                &standing.division_name
+            } else {
+                "Wild Card"
+            }),
         }
+    }
+
+    /// True when a horizontal rule belongs under this row: the playoff cut,
+    /// after the second wild card in each conference.
+    pub fn is_playoff_cut(&self, standing: &Standing) -> bool {
+        self.standings_filter == StandingsFilter::Wildcard && standing.wildcard_sequence == Some(2)
     }
 
     /// The leaderboard for whichever leaders tab is active. Skaters and
@@ -728,9 +852,14 @@ impl App {
                 feed!(plan.leaders, client.get_skater_leaders(LEADER_LIMIT)),
                 feed!(plan.leaders, client.get_goalie_leaders(LEADER_LIMIT)),
             );
-            let boxscore = match boxscore_id {
-                Some(id) => Some(client.get_boxscore(id).await.map_err(|e| e.to_string())),
-                None => None,
+            // Shots on goal come from a second, smaller endpoint, and only
+            // while the overlay is actually open.
+            let (boxscore, game_stats) = match boxscore_id {
+                Some(id) => {
+                    let (b, g) = tokio::join!(client.get_boxscore(id), client.get_game_stats(id));
+                    (Some(b.map_err(|e| e.to_string())), g.ok())
+                }
+                None => (None, None),
             };
             let _ = tx.send(Action::Fetched(Box::new(Fetched {
                 request_id,
@@ -740,6 +869,7 @@ impl App {
                 leaders,
                 goalies,
                 boxscore,
+                game_stats,
             })));
         });
     }
@@ -791,6 +921,9 @@ impl App {
             Some(Ok(boxscore)) => self.boxscore = Some(boxscore),
             Some(Err(e)) => errors.push(e),
             None => {}
+        }
+        if fetched.game_stats.is_some() {
+            self.game_stats = fetched.game_stats;
         }
 
         self.error = errors.first().cloned();
@@ -847,8 +980,99 @@ mod tests {
 
     #[test]
     fn standings_filters_cycle() {
-        assert_eq!(StandingsFilter::Conference.prev(), StandingsFilter::League);
-        assert_eq!(StandingsFilter::League.next(), StandingsFilter::Conference);
+        assert_eq!(StandingsFilter::Wildcard.prev(), StandingsFilter::League);
+        assert_eq!(StandingsFilter::League.next(), StandingsFilter::Wildcard);
+    }
+
+    #[test]
+    fn the_date_prompt_captures_typing_and_jumps() {
+        let mut app = app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        for c in "2026-03-10".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        // Digits typed into the prompt must not be read as tab switches.
+        assert_eq!(app.active_tab, Tab::Scores);
+
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, Some(Action::Refresh)));
+        assert_eq!(app.date_str(), "2026-03-10");
+        assert!(app.date_input.is_none());
+    }
+
+    #[test]
+    fn the_date_prompt_rejects_nonsense_without_moving() {
+        let mut app = app();
+        let before = app.current_date;
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        for c in "2026-99-99".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.current_date, before);
+        assert!(app.error.is_some(), "the user is told why nothing happened");
+    }
+
+    #[test]
+    fn esc_cancels_the_date_prompt() {
+        let mut app = app();
+        let before = app.current_date;
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.date_input.is_none());
+        assert_eq!(app.current_date, before);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_d_still_pages_now_that_d_opens_the_prompt() {
+        let mut app = app();
+        app.scores = Some(ScoreResponse {
+            games: (0..30).map(|i| game(i, ("TOR", 0), ("MTL", 0))).collect(),
+        });
+        app.viewport_rows.set(10);
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.scores_scroll, 5);
+        assert!(app.date_input.is_none(), "Ctrl-D must not open the prompt");
+    }
+
+    #[test]
+    fn playoff_spots_follow_the_wildcard_sequence() {
+        let team = |wildcard: Option<u32>| Standing {
+            team_name: TeamName {
+                default: "T".into(),
+            },
+            team_abbrev: TeamAbbrev {
+                default: "T".into(),
+            },
+            conference_name: "Eastern".into(),
+            division_name: "Atlantic".into(),
+            games_played: 0,
+            wins: 0,
+            losses: 0,
+            ot_losses: 0,
+            points: 0,
+            goal_for: 0,
+            goal_against: 0,
+            goal_differential: 0,
+            streak_code: None,
+            streak_count: None,
+            division_sequence: None,
+            conference_sequence: None,
+            league_sequence: None,
+            point_pctg: None,
+            l10_wins: Some(7),
+            l10_losses: Some(2),
+            l10_ot_losses: Some(1),
+            wildcard_sequence: wildcard,
+        };
+        // 0 is a division top three; 1 and 2 are the wild cards.
+        assert!(team(Some(0)).in_playoff_spot());
+        assert!(team(Some(2)).in_playoff_spot());
+        assert!(!team(Some(3)).in_playoff_spot());
+        assert!(!team(None).in_playoff_spot());
+        assert_eq!(team(None).last_ten().as_deref(), Some("7-2-1"));
     }
 
     #[test]
@@ -937,6 +1161,7 @@ mod tests {
             leaders: None,
             goalies: None,
             boxscore: None,
+            game_stats: None,
         };
         app.apply_fetch(stale);
         assert!(app.scores.is_none(), "a superseded response must not land");
