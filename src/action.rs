@@ -6,8 +6,10 @@ use crate::app::Fetched;
 pub enum Action {
     /// Redraw the screen.
     Render,
-    /// Kick off a background fetch of every panel's data.
+    /// Fetch whichever feeds have gone stale.
     Refresh,
+    /// Fetch every feed regardless of freshness, for an explicit `r`.
+    ForceRefresh,
     /// A background fetch finished. Boxed: the payload is large and this
     /// variant would otherwise dominate the size of every `Action`.
     Fetched(Box<Fetched>),

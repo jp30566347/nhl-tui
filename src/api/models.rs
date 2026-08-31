@@ -62,7 +62,9 @@ impl PeriodDescriptor {
                 2 => "2nd".to_string(),
                 3 => "3rd".to_string(),
                 4 => "OT".to_string(),
-                n => format!("{}OT", n - 3),
+                // saturating: the period number is server-supplied, and 0
+                // would underflow.
+                n => format!("{}OT", n.saturating_sub(3)),
             },
         }
     }

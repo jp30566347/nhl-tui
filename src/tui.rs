@@ -128,13 +128,14 @@ impl Tui {
     }
 
     async fn event_loop(&mut self, app: &mut App) -> Result<()> {
-        app.spawn_fetch(self.action_tx.clone());
+        app.spawn_fetch(self.action_tx.clone(), true);
         self.draw(app)?;
 
         while let Some(action) = self.action_rx.recv().await {
             match action {
                 Action::Render => {}
-                Action::Refresh => app.spawn_fetch(self.action_tx.clone()),
+                Action::Refresh => app.spawn_fetch(self.action_tx.clone(), false),
+                Action::ForceRefresh => app.spawn_fetch(self.action_tx.clone(), true),
                 Action::Fetched(fetched) => {
                     if app.apply_fetch(*fetched) {
                         bell();
