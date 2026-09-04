@@ -525,15 +525,58 @@ impl App {
         None
     }
 
-    /// The nearest day on either side of the current week that has games.
-    /// The schedule endpoint reports these, which is the only cheap way to
-    /// skip a long gap such as the offseason.
+    /// The nearest day on either side that actually has games.
+    ///
+    /// The week we already hold is checked first, because the endpoint's
+    /// `nextStartDate` is the start of the next week that contains games, not
+    /// the first day with games in it. In September it points at a Friday
+    /// with nothing scheduled while the games start on the Saturday, and
+    /// in-season it skips right over the rest of the current week.
+    /// The final filter matters while a jump is still loading: the schedule
+    /// on hand is the old one, and its pointer is the date already on screen.
+    /// Offering it would render "Next game day" as the current day and make
+    /// the key a no-op.
     pub fn next_game_day(&self) -> Option<NaiveDate> {
-        parse_date(self.schedule.as_ref()?.next_start_date.as_deref()?)
+        let schedule = self.schedule.as_ref()?;
+        self.week_day_with_games(schedule, false)
+            .or_else(|| parse_date(schedule.next_start_date.as_deref()?))
+            .filter(|date| *date > self.current_date)
     }
 
     pub fn previous_game_day(&self) -> Option<NaiveDate> {
-        parse_date(self.schedule.as_ref()?.previous_start_date.as_deref()?)
+        let schedule = self.schedule.as_ref()?;
+        self.week_day_with_games(schedule, true)
+            .or_else(|| parse_date(schedule.previous_start_date.as_deref()?))
+            .filter(|date| *date < self.current_date)
+    }
+
+    /// The nearest day in the fetched week that has games, before or after
+    /// the date on screen. `None` when the week holds nothing on that side,
+    /// which is when the endpoint's own answer is the best available.
+    fn week_day_with_games(
+        &self,
+        schedule: &crate::api::models::ScheduleResponse,
+        before: bool,
+    ) -> Option<NaiveDate> {
+        let mut days: Vec<NaiveDate> = schedule
+            .game_week
+            .iter()
+            .filter(|day| !day.games.is_empty())
+            .filter_map(|day| parse_date(&day.date))
+            .filter(|date| {
+                if before {
+                    *date < self.current_date
+                } else {
+                    *date > self.current_date
+                }
+            })
+            .collect();
+        days.sort_unstable();
+        if before {
+            days.pop()
+        } else {
+            days.into_iter().next()
+        }
     }
 
     /// First day of the regular season, for the offseason placeholder.
@@ -943,6 +986,125 @@ mod tests {
 
     fn app() -> App {
         App::new(Some("tor".into()), 0)
+    }
+
+    /// A schedule whose week holds games only on the given dates, plus the
+    /// endpoint's own next/previous pointers.
+    fn schedule_week(
+        days_with_games: &[&str],
+        empty_days: &[&str],
+        next: Option<&str>,
+        previous: Option<&str>,
+    ) -> crate::api::models::ScheduleResponse {
+        use crate::api::models::{GameDay, ScheduleResponse};
+        let day = |date: &str, games: usize| GameDay {
+            date: date.to_string(),
+            day_abbrev: "Fri".into(),
+            games: (0..games).map(|_| schedule_game()).collect(),
+        };
+        let mut game_week: Vec<GameDay> = empty_days.iter().map(|d| day(d, 0)).collect();
+        game_week.extend(days_with_games.iter().map(|d| day(d, 2)));
+        game_week.sort_by(|a, b| a.date.cmp(&b.date));
+        ScheduleResponse {
+            game_week,
+            next_start_date: next.map(str::to_string),
+            previous_start_date: previous.map(str::to_string),
+            regular_season_start_date: None,
+        }
+    }
+
+    fn schedule_game() -> crate::api::models::ScheduleGame {
+        serde_json::from_str(
+            r#"{"startTimeUTC":"2026-09-17T23:00:00Z",
+                "awayTeam":{"abbrev":"TOR","placeName":{"default":"Toronto"}},
+                "homeTeam":{"abbrev":"MTL","placeName":{"default":"Montreal"}}}"#,
+        )
+        .expect("schedule game fixture should parse")
+    }
+
+    /// The endpoint's nextStartDate is the start of the next week that has
+    /// games, not the first day with games. Following it blindly skipped the
+    /// rest of the current week.
+    #[test]
+    fn the_next_game_day_prefers_a_day_in_the_week_we_already_have() {
+        let mut a = app();
+        a.current_date = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        a.schedule = Some(schedule_week(
+            &["2026-09-17"],
+            &["2026-09-15", "2026-09-16"],
+            Some("2026-09-25"),
+            None,
+        ));
+        assert_eq!(
+            a.next_game_day(),
+            Some(NaiveDate::from_ymd_opt(2026, 9, 17).unwrap()),
+            "should not skip past the 17th to the endpoint's own answer"
+        );
+    }
+
+    #[test]
+    fn the_previous_game_day_prefers_the_latest_earlier_day_in_the_week() {
+        let mut a = app();
+        a.current_date = NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
+        a.schedule = Some(schedule_week(
+            &["2026-09-15", "2026-09-17"],
+            &["2026-09-18"],
+            None,
+            Some("2026-06-12"),
+        ));
+        assert_eq!(
+            a.previous_game_day(),
+            Some(NaiveDate::from_ymd_opt(2026, 9, 17).unwrap())
+        );
+    }
+
+    /// The offseason: the whole week is empty, so the endpoint's pointer is
+    /// the only thing to go on.
+    #[test]
+    fn an_empty_week_falls_back_to_the_endpoints_own_pointers() {
+        let mut a = app();
+        a.current_date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        a.schedule = Some(schedule_week(
+            &[],
+            &["2026-09-04", "2026-09-05"],
+            Some("2026-09-18"),
+            Some("2026-06-12"),
+        ));
+        assert_eq!(
+            a.next_game_day(),
+            Some(NaiveDate::from_ymd_opt(2026, 9, 18).unwrap())
+        );
+        assert_eq!(
+            a.previous_game_day(),
+            Some(NaiveDate::from_ymd_opt(2026, 6, 12).unwrap())
+        );
+    }
+
+    /// While a jump is loading, the schedule on hand is the previous one and
+    /// its pointer is the date already on screen. Offering it would print
+    /// "Next game day" as today and leave the key doing nothing.
+    #[test]
+    fn a_stale_pointer_at_the_current_date_is_not_offered() {
+        let mut a = app();
+        a.current_date = NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
+        a.schedule = Some(schedule_week(
+            &[],
+            &["2026-09-04"],
+            Some("2026-09-18"),
+            Some("2026-09-18"),
+        ));
+        assert_eq!(a.next_game_day(), None);
+        assert_eq!(a.previous_game_day(), None);
+    }
+
+    /// A day with games on the far side must not be offered as the near one.
+    #[test]
+    fn the_current_date_is_never_offered_as_its_own_next_or_previous() {
+        let mut a = app();
+        a.current_date = NaiveDate::from_ymd_opt(2026, 9, 17).unwrap();
+        a.schedule = Some(schedule_week(&["2026-09-17"], &[], None, None));
+        assert_eq!(a.next_game_day(), None);
+        assert_eq!(a.previous_game_day(), None);
     }
 
     fn game(id: u64, away: (&str, u32), home: (&str, u32)) -> Game {

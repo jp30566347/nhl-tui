@@ -138,6 +138,26 @@ fn scroll_offset(selected: usize, height: usize, total: usize) -> usize {
     selected.saturating_sub(height - 1).min(total - height)
 }
 
+/// "Tampa Bay Lightning (TBL)" when it fits, else "Tampa Bay Lightning", else
+/// the name truncated.
+///
+/// The table widget cuts a cell at the column edge, which left rows reading
+/// "Tampa Bay Lightning (T" once the pane narrowed. Dropping the whole
+/// bracketed abbreviation reads as a choice; cutting into it reads as a bug.
+fn team_label(name: &str, abbrev: &str, width: u16) -> String {
+    let width = width as usize;
+    let full = format!("{name} ({abbrev})");
+    if full.chars().count() <= width {
+        return full;
+    }
+    if name.chars().count() <= width {
+        return name.to_string();
+    }
+    let mut out: String = name.chars().take(width.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
 fn panel(title: String, hint: &'static str) -> Block<'static> {
     Block::default()
         .title(title)
@@ -312,15 +332,28 @@ const OPTIONAL_COLUMNS: &[(&str, u16)] = &[
     ("GA", 5),
 ];
 /// Indicator, #, Team, GP, W, L, OT, PTS.
-const CORE_WIDTH: u16 = 2 + 3 + 28 + 4 + 4 + 4 + 4 + 5;
+/// Widest the team column ever gets. Long names lose their bracketed
+/// abbreviation before they lose their letters.
+const TEAM_WIDTH: u16 = 28;
+const CORE_WIDTH: u16 = 2 + 3 + TEAM_WIDTH + 4 + 4 + 4 + 4 + 5;
+
+/// One blank cell between columns, which is the table widget's default and
+/// has to be budgeted for or the last column is squeezed instead.
+const COLUMN_SPACING: u16 = 1;
+/// Indicator, #, Team, GP, W, L, OT, PTS, plus the trailing spacer column.
+const CORE_COLUMNS: u16 = 9;
 
 /// Which optional columns fit, as a mask over `OPTIONAL_COLUMNS`.
+///
+/// Counting only the column widths overflowed the pane by one cell per gap,
+/// and the table absorbed that by shrinking the team name until it read
+/// "Tampa Bay Lightning (T". The gaps are counted here instead.
 fn columns_for_width(width: u16) -> [bool; 6] {
     let mut keep = [false; 6];
-    let mut used = CORE_WIDTH;
+    let mut used = CORE_WIDTH + COLUMN_SPACING * (CORE_COLUMNS - 1);
     for (i, (_, w)) in OPTIONAL_COLUMNS.iter().enumerate() {
-        if used + w <= width {
-            used += w;
+        if used + w + COLUMN_SPACING <= width {
+            used += w + COLUMN_SPACING;
             keep[i] = true;
         }
     }
@@ -347,7 +380,7 @@ fn draw_standings(f: &mut Frame, app: &App, area: Rect) {
     let mut widths = vec![
         Constraint::Length(2),
         Constraint::Length(3),
-        Constraint::Max(28),
+        Constraint::Max(TEAM_WIDTH),
         Constraint::Length(4),
         Constraint::Length(4),
         Constraint::Length(4),
@@ -407,9 +440,10 @@ fn draw_standings(f: &mut Frame, app: &App, area: Rect) {
             })
             .style(Style::new().fg(Color::Green)),
             Cell::from(seq.to_string()),
-            Cell::from(format!(
-                "{} ({})",
-                standing.team_name.default, standing.team_abbrev.default
+            Cell::from(team_label(
+                &standing.team_name.default,
+                &standing.team_abbrev.default,
+                TEAM_WIDTH,
             )),
             Cell::from(standing.games_played.to_string()),
             Cell::from(standing.wins.to_string()),
@@ -1083,7 +1117,49 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::scroll_offset;
+    use super::{columns_for_width, scroll_offset, team_label, CORE_WIDTH};
+
+    #[test]
+    fn a_team_label_keeps_its_abbreviation_when_there_is_room() {
+        assert_eq!(
+            team_label("Tampa Bay Lightning", "TBL", 28),
+            "Tampa Bay Lightning (TBL)"
+        );
+    }
+
+    /// The table cuts a cell at the column edge, which used to leave rows
+    /// reading "Tampa Bay Lightning (T".
+    #[test]
+    fn a_team_label_drops_the_whole_abbreviation_rather_than_cutting_into_it() {
+        let label = team_label("Tampa Bay Lightning", "TBL", 22);
+        assert_eq!(label, "Tampa Bay Lightning");
+        assert!(!label.contains('('));
+    }
+
+    #[test]
+    fn a_team_label_too_long_even_without_its_abbreviation_is_elided() {
+        let label = team_label("Tampa Bay Lightning", "TBL", 10);
+        assert_eq!(label.chars().count(), 10);
+        assert!(label.ends_with('\u{2026}'));
+    }
+
+    /// The gaps between columns are real cells. Ignoring them overflowed the
+    /// pane and the table paid for it by squeezing the team name.
+    #[test]
+    fn column_fitting_budgets_the_space_between_columns() {
+        // The core columns plus their eight gaps, then exactly enough for the
+        // first optional column and the gap before it.
+        let exactly_one = CORE_WIDTH + 8 + 6 + 1;
+        assert!(columns_for_width(exactly_one)[0]);
+        assert!(!columns_for_width(exactly_one)[1]);
+        // One cell short, and the gap is what does not fit.
+        assert!(!columns_for_width(exactly_one - 1)[0]);
+    }
+
+    #[test]
+    fn a_narrow_pane_keeps_no_optional_columns() {
+        assert_eq!(columns_for_width(CORE_WIDTH), [false; 6]);
+    }
 
     #[test]
     fn short_lists_never_scroll() {
