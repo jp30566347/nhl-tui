@@ -50,6 +50,82 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.show_help {
         draw_help_overlay(f, area);
     }
+    if let Some(input) = &app.date_input {
+        draw_date_prompt(f, input, area);
+    }
+}
+
+/// A one-line text field for jumping to an arbitrary date. Stepping a day or
+/// a week at a time cannot cross the offseason in any reasonable number of
+/// keystrokes.
+fn draw_date_prompt(f: &mut Frame, input: &str, area: Rect) {
+    let overlay = centered_size(40, 3, area);
+    f.render_widget(Clear, overlay);
+    let block = Block::default()
+        .title(" Go to date ")
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(overlay);
+    f.render_widget(block, overlay);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(input.to_string(), Style::new().bold()),
+            // A block cursor, since the real one is hidden.
+            Span::styled("\u{2588}", Style::new().fg(Color::Yellow)),
+            Span::styled(
+                format!(
+                    "{}  YYYY-MM-DD",
+                    " ".repeat(10usize.saturating_sub(input.len()))
+                ),
+                MUTED,
+            ),
+        ])),
+        inner,
+    );
+}
+
+/// What to show when a day has no games: where the season is, and the keys
+/// that get there. Without this the offseason is a blank pane.
+fn no_games_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled("No games on this date.", MUTED), Line::raw("")];
+    if let Some(next) = app.next_game_day() {
+        lines.push(Line::from(vec![
+            Span::styled("Next game day: ", MUTED),
+            Span::styled(next.format("%a %-d %b %Y").to_string(), FAVORITE),
+            Span::styled("   press n", MUTED),
+        ]));
+    }
+    if let Some(previous) = app.previous_game_day() {
+        lines.push(Line::from(vec![
+            Span::styled("Previous:      ", MUTED),
+            Span::styled(previous.format("%a %-d %b %Y").to_string(), FAVORITE),
+            Span::styled("   press p", MUTED),
+        ]));
+    }
+    if let Some(start) = app.regular_season_start() {
+        if app.current_date < start {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                format!("Regular season opens {}", start.format("%-d %B %Y")),
+                MUTED,
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("d  jump to any date", MUTED));
+    lines
+}
+
+fn draw_centered_lines(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let height = lines.len() as u16;
+    let top = area.y + area.height.saturating_sub(height) / 2;
+    let inner = Rect {
+        y: top.min(area.y + area.height),
+        height: height.min(area.height),
+        ..area
+    };
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
 /// Offset that keeps `selected` on screen without storing scroll position
@@ -86,11 +162,11 @@ fn date_title(app: &App, name: &str) -> String {
     }
 }
 
-fn header_row(labels: &[&'static str]) -> Row<'static> {
+fn header_row(labels: &[&str]) -> Row<'static> {
     Row::new(
         labels
             .iter()
-            .map(|l| Cell::from(*l).style(Style::new().bold())),
+            .map(|l| Cell::from(l.to_string()).style(Style::new().bold())),
     )
 }
 
@@ -121,7 +197,7 @@ fn draw_scores(f: &mut Frame, app: &App, area: Rect) {
         return placeholder(f, inner, "Loading\u{2026}", Style::new());
     };
     if scores.games.is_empty() {
-        return placeholder(f, inner, "No games.", MUTED);
+        return draw_centered_lines(f, inner, no_games_lines(app));
     }
 
     let lines: Vec<Line> = scores
@@ -225,6 +301,32 @@ fn start_time(utc: Option<&str>) -> String {
         .unwrap_or_else(|| "TBD".to_string())
 }
 
+/// Standings columns beyond the core set, in the order they are given up as
+/// the terminal narrows. Rendering order is fixed separately below.
+const OPTIONAL_COLUMNS: &[(&str, u16)] = &[
+    ("P%", 6),
+    ("L10", 9),
+    ("STRK", 6),
+    ("+/-", 5),
+    ("GF", 5),
+    ("GA", 5),
+];
+/// Indicator, #, Team, GP, W, L, OT, PTS.
+const CORE_WIDTH: u16 = 2 + 3 + 28 + 4 + 4 + 4 + 4 + 5;
+
+/// Which optional columns fit, as a mask over `OPTIONAL_COLUMNS`.
+fn columns_for_width(width: u16) -> [bool; 6] {
+    let mut keep = [false; 6];
+    let mut used = CORE_WIDTH;
+    for (i, (_, w)) in OPTIONAL_COLUMNS.iter().enumerate() {
+        if used + w <= width {
+            used += w;
+            keep[i] = true;
+        }
+    }
+    keep
+}
+
 fn draw_standings(f: &mut Frame, app: &App, area: Rect) {
     let block = panel(
         format!(" Standings [{}] ", app.standings_filter.as_str()),
@@ -238,17 +340,42 @@ fn draw_standings(f: &mut Frame, app: &App, area: Rect) {
         return placeholder(f, inner, "Loading\u{2026}", Style::new());
     }
 
-    let mut rows = Vec::with_capacity(filtered.len() + 4);
+    let keep = columns_for_width(inner.width);
+    // Display order, independent of the order columns are dropped in.
+    let order = [0usize, 1, 4, 5, 3, 2]; // P%, L10, GF, GA, +/-, STRK
+
+    let mut widths = vec![
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Max(28),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(5),
+    ];
+    let mut headers: Vec<&'static str> = vec!["", "#", "Team", "GP", "W", "L", "OT", "PTS"];
+    for &i in &order {
+        if keep[i] {
+            headers.push(OPTIONAL_COLUMNS[i].0);
+            widths.push(Constraint::Length(OPTIONAL_COLUMNS[i].1));
+        }
+    }
+    widths.push(Constraint::Min(0));
+    headers.push("");
+
+    let mut rows = Vec::with_capacity(filtered.len() + 6);
     let mut selected_row = 0;
     let mut current_group: Option<String> = None;
 
-    for (i, s) in filtered.iter().enumerate() {
-        if let Some(group) = app.standings_group(s) {
+    for (i, standing) in filtered.iter().enumerate() {
+        if let Some(group) = app.standings_group(standing) {
             if current_group.as_deref() != Some(group) {
                 current_group = Some(group.to_string());
-                // The label goes in the Team column; the first column is only
-                // three cells wide and would clip it.
+                // The label goes in the Team column; the first columns are
+                // only a few cells wide and would clip it.
                 rows.push(Row::new(vec![
+                    Cell::from(""),
                     Cell::from(""),
                     Cell::from(format!("\u{2500} {group} \u{2500}")).style(HEADING),
                 ]));
@@ -260,62 +387,79 @@ fn draw_standings(f: &mut Frame, app: &App, area: Rect) {
         }
 
         let seq = match app.standings_filter {
-            StandingsFilter::League => s.league_sequence,
-            StandingsFilter::Conference => s.conference_sequence,
-            StandingsFilter::Division => s.division_sequence,
+            StandingsFilter::League => standing.league_sequence,
+            StandingsFilter::Conference => standing.conference_sequence,
+            StandingsFilter::Division | StandingsFilter::Wildcard => standing.division_sequence,
         }
         .unwrap_or(i as u32 + 1);
+        // In the wild card block the divisional rank is meaningless; show the
+        // race position instead.
+        let seq = match (app.standings_filter, standing.wildcard_sequence) {
+            (StandingsFilter::Wildcard, Some(w)) if w > 0 => w,
+            _ => seq,
+        };
 
-        let style = if app.is_favorite_team(&s.team_abbrev.default) {
+        let mut cells = vec![
+            Cell::from(if standing.in_playoff_spot() {
+                " \u{25CF}"
+            } else {
+                ""
+            })
+            .style(Style::new().fg(Color::Green)),
+            Cell::from(seq.to_string()),
+            Cell::from(format!(
+                "{} ({})",
+                standing.team_name.default, standing.team_abbrev.default
+            )),
+            Cell::from(standing.games_played.to_string()),
+            Cell::from(standing.wins.to_string()),
+            Cell::from(standing.losses.to_string()),
+            Cell::from(standing.ot_losses.to_string()),
+            Cell::from(standing.points.to_string()),
+        ];
+        for &i in &order {
+            if !keep[i] {
+                continue;
+            }
+            cells.push(Cell::from(match OPTIONAL_COLUMNS[i].0 {
+                "P%" => standing
+                    .point_pctg
+                    .map(|p| format!("{p:.3}").trim_start_matches('0').to_string())
+                    .unwrap_or_default(),
+                "L10" => standing.last_ten().unwrap_or_default(),
+                "STRK" => format!(
+                    "{}{}",
+                    standing.streak_code.as_deref().unwrap_or(""),
+                    standing.streak_count.unwrap_or(0)
+                ),
+                "+/-" => format!("{:+}", standing.goal_differential),
+                "GF" => standing.goal_for.to_string(),
+                "GA" => standing.goal_against.to_string(),
+                _ => String::new(),
+            }));
+        }
+
+        let style = if app.is_favorite_team(&standing.team_abbrev.default) {
             FAVORITE
         } else {
             Style::new()
         };
+        rows.push(Row::new(cells).style(style));
 
-        rows.push(
-            Row::new(vec![
-                seq.to_string(),
-                format!("{} ({})", s.team_name.default, s.team_abbrev.default),
-                s.games_played.to_string(),
-                s.wins.to_string(),
-                s.losses.to_string(),
-                s.ot_losses.to_string(),
-                s.points.to_string(),
-                s.goal_for.to_string(),
-                s.goal_against.to_string(),
-                format!("{:+}", s.goal_differential),
-                format!(
-                    "{}{}",
-                    s.streak_code.as_deref().unwrap_or(""),
-                    s.streak_count.unwrap_or(0)
-                ),
-            ])
-            .style(style),
-        );
+        // The playoff cut: everything above this line is currently in.
+        if app.is_playoff_cut(standing) {
+            rows.push(Row::new(vec![
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from("\u{2504}".repeat(28)).style(MUTED),
+            ]));
+        }
     }
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Max(30),
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(6),
-            Constraint::Min(0),
-        ],
-    )
-    .header(header_row(&[
-        "#", "Team", "GP", "W", "L", "OT", "PTS", "GF", "GA", "+/-", "STRK", "",
-    ]))
-    .row_highlight_style(SELECTED_STYLE)
-    .highlight_spacing(HighlightSpacing::Always);
+    let table = Table::new(rows, widths)
+        .header(header_row(&headers))
+        .row_highlight_style(SELECTED_STYLE)
+        .highlight_spacing(HighlightSpacing::Always);
 
     // Rendering with state lets ratatui scroll the selection into view.
     let mut state = TableState::new().with_selected(Some(selected_row));
@@ -391,7 +535,7 @@ fn draw_schedule(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if game_idx == 0 {
-        return placeholder(f, inner, "No games.", MUTED);
+        return draw_centered_lines(f, inner, no_games_lines(app));
     }
 
     let offset = scroll_offset(selected_line, inner.height as usize, lines.len());
@@ -555,48 +699,19 @@ fn draw_boxscore_overlay(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            // Header plus a goals and a shots row per side.
+            Constraint::Length(5),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
         .split(inner);
 
+    // Goals and shots per period, straight from the API rather than derived by
+    // counting the scoring summary: that mis-bucketed anything past the first
+    // overtime and counted a shootout decider as a regulation goal.
+    f.render_widget(Paragraph::new(line_score(app, away, home)), chunks[0]);
+
     let scoring = boxscore.summary.as_ref().and_then(|s| s.scoring.as_ref());
-
-    let mut period_lines = vec![Line::from(vec![
-        Span::raw("        "),
-        Span::styled("1st   2nd   3rd   OT    Total", Style::new().bold()),
-    ])];
-
-    if let Some(periods) = scoring {
-        let (mut away_goals, mut home_goals) = ([0u32; 4], [0u32; 4]);
-        for period in periods {
-            let idx = (period.period_descriptor.number as usize).clamp(1, 4) - 1;
-            for goal in &period.goals {
-                if goal.team_abbrev.default == away.abbrev {
-                    away_goals[idx] += 1;
-                } else {
-                    home_goals[idx] += 1;
-                }
-            }
-        }
-        let row = |abbrev: &str, goals: &[u32; 4]| {
-            Line::from(vec![
-                Span::styled(format!("{abbrev:<8}"), Style::new().bold()),
-                Span::raw(format!(
-                    "{:<5} {:<5} {:<5} {:<5} {}",
-                    goals[0],
-                    goals[1],
-                    goals[2],
-                    goals[3],
-                    goals.iter().sum::<u32>()
-                )),
-            ])
-        };
-        period_lines.push(row(&away.abbrev, &away_goals));
-        period_lines.push(row(&home.abbrev, &home_goals));
-    }
-    f.render_widget(Paragraph::new(period_lines), chunks[0]);
 
     let mut goal_lines = vec![Line::styled("   Goals:", Style::new().bold())];
     if let Some(periods) = scoring {
@@ -656,6 +771,87 @@ fn draw_boxscore_overlay(f: &mut Frame, app: &App, area: Rect) {
         goal_lines.push(Line::styled("   No goals.", MUTED));
     }
 
+    if let Some(periods) = boxscore.summary.as_ref().and_then(|s| s.penalties.as_ref()) {
+        let total: usize = periods.iter().map(|p| p.penalties.len()).sum();
+        if total > 0 {
+            goal_lines.push(Line::raw(""));
+            goal_lines.push(Line::styled("   Penalties:", Style::new().bold()));
+            for period in periods {
+                let period_label = period.period_descriptor.label();
+                for penalty in &period.penalties {
+                    let who = penalty
+                        .committed_by_player
+                        .as_ref()
+                        .map(|p| format!("{} {}", initial(&p.first_name), text(&p.last_name)))
+                        .unwrap_or_default();
+                    goal_lines.push(Line::from(vec![
+                        Span::styled(format!("   {period_label:<5} "), MUTED),
+                        Span::styled(format!("{:<5} ", penalty.time_in_period), MUTED),
+                        Span::styled(
+                            format!(
+                                "{} - ",
+                                penalty
+                                    .team_abbrev
+                                    .as_ref()
+                                    .map(|t| t.default.as_str())
+                                    .unwrap_or("")
+                            ),
+                            HEADING,
+                        ),
+                        Span::raw(who),
+                        Span::styled(
+                            format!(
+                                " {} min, {}",
+                                penalty.duration.unwrap_or(0),
+                                // Slugs arrive as "delaying-game-puck-over-glass".
+                                penalty
+                                    .desc_key
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .replace(['-', '_'], " ")
+                            ),
+                            MUTED,
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+
+    if let Some(stars) = boxscore
+        .summary
+        .as_ref()
+        .and_then(|s| s.three_stars.as_ref())
+    {
+        if !stars.is_empty() {
+            goal_lines.push(Line::raw(""));
+            goal_lines.push(Line::styled("   Three stars:", Style::new().bold()));
+            for star in stars {
+                goal_lines.push(Line::from(vec![
+                    Span::styled(format!("   {}\u{2605}    ", star.star), FAVORITE),
+                    Span::raw(format!("{:<24}", text(&star.name))),
+                    Span::styled(
+                        format!(
+                            "{:<4}{}",
+                            star.position.as_deref().unwrap_or(""),
+                            star.team_abbrev.as_deref().unwrap_or("")
+                        ),
+                        MUTED,
+                    ),
+                    Span::styled(
+                        match (star.goals, star.assists) {
+                            (Some(g), Some(a)) => format!("   {g}G {a}A"),
+                            _ => String::new(),
+                        },
+                        MUTED,
+                    ),
+                ]));
+            }
+        }
+    }
+
+    goal_lines.extend(team_stats_lines(app, &away.abbrev, &home.abbrev));
+
     // A high-scoring game produces more goals than fit, so the list scrolls.
     // The offset is clamped here rather than in the key handler, which has no
     // idea how tall the overlay is.
@@ -710,6 +906,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         ),
         ("H / L", "Jump back / forward one week"),
         ("t", "Back to today"),
+        ("n / p", "Next / previous day with games"),
+        ("d", "Go to a specific date"),
         ("Enter", "Open the boxscore (Scores tab)"),
         ("r", "Refresh everything now"),
         ("?", "Toggle this help"),
@@ -754,6 +952,114 @@ fn centered_size(width: u16, height: u16, area: Rect) -> Rect {
         width,
         height,
     }
+}
+
+/// The per-period grid: a goals row and a shots row per side, with a column
+/// for every period the game actually reached.
+fn line_score(
+    app: &App,
+    away: &crate::api::models::BoxscoreTeam,
+    home: &crate::api::models::BoxscoreTeam,
+) -> Vec<Line<'static>> {
+    use crate::api::models::PeriodCount;
+
+    let stats = app.game_stats.as_ref();
+    let goals: &[PeriodCount] = stats
+        .and_then(|s| s.linescore.as_ref())
+        .map(|l| l.by_period.as_slice())
+        .unwrap_or(&[]);
+    let shots: &[PeriodCount] = stats.map(|s| s.shots_by_period.as_slice()).unwrap_or(&[]);
+
+    // Periods come from whichever series is longer, so a game still in the
+    // first period shows one column rather than a row of empty ones.
+    let source = if goals.len() >= shots.len() {
+        goals
+    } else {
+        shots
+    };
+    if source.is_empty() {
+        return Vec::new();
+    }
+
+    let mut header = vec![Span::raw(format!("{:<9}", ""))];
+    for period in source {
+        header.push(Span::styled(
+            format!("{:<6}", period.period_descriptor.label()),
+            Style::new().bold(),
+        ));
+    }
+    header.push(Span::styled("Total", Style::new().bold()));
+    let mut lines = vec![Line::from(header)];
+
+    let mut side = |abbrev: &str,
+                    label: &str,
+                    counts: &[PeriodCount],
+                    pick: fn(&PeriodCount) -> u32,
+                    total: Option<u32>| {
+        let mut spans = vec![
+            Span::styled(format!("{abbrev:<5}"), Style::new().bold()),
+            Span::styled(format!("{label:<4}"), MUTED),
+        ];
+        let mut sum = 0;
+        for period in source {
+            let value = counts
+                .iter()
+                .find(|c| c.period_descriptor.number == period.period_descriptor.number)
+                .map(pick);
+            sum += value.unwrap_or(0);
+            spans.push(Span::raw(format!(
+                "{:<6}",
+                value.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+            )));
+        }
+        spans.push(Span::styled(
+            total.unwrap_or(sum).to_string(),
+            Style::new().bold(),
+        ));
+        lines.push(Line::from(spans));
+    };
+
+    side(&away.abbrev, "G", goals, |c| c.away, away.score);
+    side(&away.abbrev, "SOG", shots, |c| c.away, None);
+    side(&home.abbrev, "G", goals, |c| c.home, home.score);
+    side(&home.abbrev, "SOG", shots, |c| c.home, None);
+    lines
+}
+
+/// The team stat comparison, appended below the scoring and penalty summaries.
+fn team_stats_lines(app: &App, away: &str, home: &str) -> Vec<Line<'static>> {
+    let Some(stats) = app.game_stats.as_ref() else {
+        return Vec::new();
+    };
+    let rows: Vec<_> = stats
+        .team_game_stats
+        .iter()
+        .filter_map(|stat| stat.label().map(|label| (label, stat)))
+        .collect();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled("   Team stats:", Style::new().bold()),
+        Line::from(vec![
+            Span::raw(format!("   {:<14}", "")),
+            Span::styled(format!("{away:<8}"), Style::new().bold()),
+            Span::styled(home.to_string(), Style::new().bold()),
+        ]),
+    ];
+    for (label, stat) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {label:<14}"), MUTED),
+            Span::raw(format!(
+                "{:<8}",
+                crate::api::models::stat_value(&stat.away_value)
+            )),
+            Span::raw(crate::api::models::stat_value(&stat.home_value)),
+        ]));
+    }
+    lines
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
