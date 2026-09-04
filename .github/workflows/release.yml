@@ -60,7 +60,14 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../nhl-tui-${{ matrix.target }}.tar.gz nhl-tui
           cd ../../..
-          sha256sum nhl-tui-${{ matrix.target }}.tar.gz > nhl-tui-${{ matrix.target }}.tar.gz.sha256
+          # The macOS runners ship BSD shasum, not GNU coreutils, so
+          # sha256sum is not there to be called.
+          archive=nhl-tui-${{ matrix.target }}.tar.gz
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
 
       - name: Package (windows)
         if: contains(matrix.target, 'windows')
