@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDate};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,6 +11,9 @@ use crate::api::models::*;
 use crate::api::NhlClient;
 
 const LEADER_LIMIT: u32 = 10;
+/// How long standings, schedule, and season leaders stay fresh. They change
+/// about once a day; scores are always re-fetched on the live interval.
+const SLOW_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -16,10 +21,25 @@ pub enum Tab {
     Standings,
     Schedule,
     Leaders,
+    Goalies,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Scores, Tab::Standings, Tab::Schedule, Tab::Leaders];
+    pub const ALL: [Tab; 5] = [
+        Tab::Scores,
+        Tab::Standings,
+        Tab::Schedule,
+        Tab::Leaders,
+        Tab::Goalies,
+    ];
+
+    pub fn next(self) -> Self {
+        cycle(&Self::ALL, self, 1)
+    }
+
+    pub fn prev(self) -> Self {
+        cycle(&Self::ALL, self, -1)
+    }
 
     pub fn from_index(i: usize) -> Self {
         Self::ALL.get(i).copied().unwrap_or(Tab::Scores)
@@ -34,7 +54,8 @@ impl Tab {
             Tab::Scores => "[1] Scores",
             Tab::Standings => "[2] Standings",
             Tab::Schedule => "[3] Schedule",
-            Tab::Leaders => "[4] Leaders",
+            Tab::Leaders => "[4] Skaters",
+            Tab::Goalies => "[5] Goalies",
         }
     }
 }
@@ -149,6 +170,61 @@ impl LeaderCategory {
     }
 }
 
+/// The four categories the goalie stats-leaders endpoint serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalieCategory {
+    Wins,
+    GoalsAgainstAverage,
+    SavePercentage,
+    Shutouts,
+}
+
+impl GoalieCategory {
+    pub const ALL: [GoalieCategory; 4] = [
+        GoalieCategory::Wins,
+        GoalieCategory::GoalsAgainstAverage,
+        GoalieCategory::SavePercentage,
+        GoalieCategory::Shutouts,
+    ];
+
+    pub fn next(self) -> Self {
+        cycle(&Self::ALL, self, 1)
+    }
+
+    pub fn prev(self) -> Self {
+        cycle(&Self::ALL, self, -1)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GoalieCategory::Wins => "Wins",
+            GoalieCategory::GoalsAgainstAverage => "GAA",
+            GoalieCategory::SavePercentage => "Save %",
+            GoalieCategory::Shutouts => "Shutouts",
+        }
+    }
+
+    pub fn api_key(self) -> &'static str {
+        match self {
+            GoalieCategory::Wins => "wins",
+            GoalieCategory::GoalsAgainstAverage => "goalsAgainstAverage",
+            GoalieCategory::SavePercentage => "savePctg",
+            GoalieCategory::Shutouts => "shutouts",
+        }
+    }
+
+    pub fn format_value(self, value: f64) -> String {
+        match self {
+            // Save percentage is conventionally written .921, not 0.921.
+            GoalieCategory::SavePercentage => {
+                format!("{:.3}", value).trim_start_matches('0').to_string()
+            }
+            GoalieCategory::GoalsAgainstAverage => format!("{value:.2}"),
+            _ => format!("{}", value.round() as i64),
+        }
+    }
+}
+
 fn cycle<T: Copy + PartialEq>(all: &[T], current: T, step: isize) -> T {
     let len = all.len();
     let idx = all.iter().position(|v| *v == current).unwrap_or(0);
@@ -161,11 +237,26 @@ pub struct Fetched {
     /// Identifies the request that produced this. Results from a superseded
     /// request (the user changed the date mid-flight) are dropped.
     pub request_id: u64,
-    pub scores: Result<ScoreResponse, String>,
-    pub standings: Result<StandingsResponse, String>,
-    pub schedule: Result<ScheduleResponse, String>,
-    pub leaders: Result<HashMap<String, Vec<StatLeader>>, String>,
+    /// `None` means the feed was still fresh and was not requested.
+    pub scores: Option<Result<ScoreResponse, String>>,
+    pub standings: Option<Result<StandingsResponse, String>>,
+    pub schedule: Option<Result<ScheduleResponse, String>>,
+    pub leaders: Option<Result<HashMap<String, Vec<StatLeader>>, String>>,
+    pub goalies: Option<Result<HashMap<String, Vec<StatLeader>>, String>>,
     pub boxscore: Option<Result<BoxscoreResponse, String>>,
+}
+
+/// Which feeds a given refresh should actually request.
+///
+/// Scores change minute to minute; standings and season leaders change about
+/// once a day. Re-fetching everything on the live interval moved roughly
+/// 280 KB every 30 seconds, nearly all of it unchanged.
+#[derive(Debug, Clone, Copy)]
+struct Plan {
+    scores: bool,
+    standings: bool,
+    schedule: bool,
+    leaders: bool,
 }
 
 pub struct App {
@@ -178,17 +269,27 @@ pub struct App {
     pub standings: Option<StandingsResponse>,
     pub schedule: Option<ScheduleResponse>,
     pub leaders: HashMap<String, Vec<StatLeader>>,
+    pub goalies: HashMap<String, Vec<StatLeader>>,
     pub boxscore: Option<BoxscoreResponse>,
 
     pub standings_filter: StandingsFilter,
     pub leader_category: LeaderCategory,
+    pub goalie_category: GoalieCategory,
     pub scores_scroll: usize,
     pub standings_scroll: usize,
     pub schedule_scroll: usize,
     pub leaders_scroll: usize,
+    pub goalies_scroll: usize,
 
     pub show_boxscore: bool,
+    pub boxscore_scroll: usize,
+    pub show_help: bool,
     pub selected_game_id: Option<u64>,
+
+    /// Rows the content pane last rendered, written by the UI so that page
+    /// keys can move by an actual screenful. `Cell` because drawing only
+    /// borrows the app immutably.
+    pub viewport_rows: Cell<usize>,
 
     pub loading: bool,
     pub last_updated: Option<chrono::DateTime<Local>>,
@@ -198,6 +299,13 @@ pub struct App {
     /// Last seen combined score per game, used to detect that a favourite
     /// team's game changed while we were away.
     last_scores: HashMap<u64, u32>,
+
+    /// When each slow-moving feed last arrived, for the freshness check.
+    standings_at: Option<Instant>,
+    schedule_at: Option<Instant>,
+    leaders_at: Option<Instant>,
+    /// The date the cached schedule covers.
+    schedule_for: Option<NaiveDate>,
 
     request_id: u64,
     client: NhlClient,
@@ -214,86 +322,141 @@ impl App {
             standings: None,
             schedule: None,
             leaders: HashMap::new(),
+            goalies: HashMap::new(),
             boxscore: None,
             standings_filter: StandingsFilter::Conference,
             leader_category: LeaderCategory::Points,
+            goalie_category: GoalieCategory::Wins,
             scores_scroll: 0,
             standings_scroll: 0,
             schedule_scroll: 0,
             leaders_scroll: 0,
+            goalies_scroll: 0,
             show_boxscore: false,
+            boxscore_scroll: 0,
+            show_help: false,
             selected_game_id: None,
+            viewport_rows: Cell::new(20),
             loading: false,
             last_updated: None,
             error: None,
             last_scores: HashMap::new(),
+            standings_at: None,
+            schedule_at: None,
+            leaders_at: None,
+            schedule_for: None,
             request_id: 0,
             client: NhlClient::new(),
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // Ctrl-C quits from anywhere, including out of an overlay.
+        if ctrl && matches!(key.code, KeyCode::Char('c')) {
+            self.should_quit = true;
+            return None;
+        }
+
+        // Overlays swallow input: Esc/q backs out of them rather than
+        // quitting, which is what Esc means in most TUIs.
+        if self.show_help {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter
+            ) {
+                self.show_help = false;
+            }
+            return None;
+        }
         if self.show_boxscore {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
-                self.show_boxscore = false;
-                self.boxscore = None;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.show_boxscore = false;
+                    self.boxscore = None;
+                    self.boxscore_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.boxscore_scroll += 1,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.boxscore_scroll = self.boxscore_scroll.saturating_sub(1)
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.boxscore_scroll = 0,
+                KeyCode::Char('?') => self.show_help = true,
+                _ => {}
             }
             return None;
         }
 
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
-            }
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('r') => return Some(Action::Refresh),
-            KeyCode::Char(c @ '1'..='4') => {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('r') => return Some(Action::ForceRefresh),
+
+            // Tab cycling, by number and by Tab/Shift-Tab.
+            KeyCode::Char(c @ '1'..='5') => {
                 self.active_tab = Tab::from_index(c as usize - '1' as usize)
             }
+            KeyCode::Tab => self.active_tab = self.active_tab.next(),
+            KeyCode::BackTab => self.active_tab = self.active_tab.prev(),
+
+            // `h`/`l` step the date on date-driven tabs and cycle the
+            // grouping everywhere else.
             KeyCode::Left | KeyCode::Char('h') => match self.active_tab {
-                Tab::Scores | Tab::Schedule => {
-                    self.current_date -= chrono::Duration::days(1);
-                    self.reset_scroll();
-                    return Some(Action::Refresh);
-                }
+                Tab::Scores | Tab::Schedule => return self.shift_date(-1),
                 Tab::Standings => self.standings_filter = self.standings_filter.prev(),
                 Tab::Leaders => {
                     self.leader_category = self.leader_category.prev();
                     self.leaders_scroll = 0;
                 }
+                Tab::Goalies => {
+                    self.goalie_category = self.goalie_category.prev();
+                    self.goalies_scroll = 0;
+                }
             },
             KeyCode::Right | KeyCode::Char('l') => match self.active_tab {
-                Tab::Scores | Tab::Schedule => {
-                    self.current_date += chrono::Duration::days(1);
-                    self.reset_scroll();
-                    return Some(Action::Refresh);
-                }
+                Tab::Scores | Tab::Schedule => return self.shift_date(1),
                 Tab::Standings => self.standings_filter = self.standings_filter.next(),
                 Tab::Leaders => {
                     self.leader_category = self.leader_category.next();
                     self.leaders_scroll = 0;
                 }
+                Tab::Goalies => {
+                    self.goalie_category = self.goalie_category.next();
+                    self.goalies_scroll = 0;
+                }
             },
-            KeyCode::Up | KeyCode::Char('k') => {
-                let scroll = self.scroll_mut();
-                *scroll = scroll.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let max = self.row_count();
-                let scroll = self.scroll_mut();
-                if *scroll + 1 < max {
-                    *scroll += 1;
+            // Shift jumps a week, so browsing to a distant date does not mean
+            // holding a key down; `t` returns to today.
+            KeyCode::Char('H') => return self.shift_date(-7),
+            KeyCode::Char('L') => return self.shift_date(7),
+            KeyCode::Char('t') => {
+                let today = Local::now().date_naive();
+                if self.current_date != today {
+                    self.current_date = today;
+                    self.reset_scroll();
+                    return Some(Action::Refresh);
                 }
             }
+
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection(-(self.page() as isize)),
+            KeyCode::PageDown => self.move_selection(self.page() as isize),
+            // Vim's half-page scroll.
+            KeyCode::Char('u') if ctrl => self.move_selection(-(self.page() as isize) / 2),
+            KeyCode::Char('d') if ctrl => self.move_selection(self.page() as isize / 2),
             KeyCode::Home | KeyCode::Char('g') => *self.scroll_mut() = 0,
             KeyCode::End | KeyCode::Char('G') => {
                 let last = self.row_count().saturating_sub(1);
                 *self.scroll_mut() = last;
             }
+
             KeyCode::Enter if self.active_tab == Tab::Scores => {
                 if let Some(game) = self.selected_game() {
                     self.selected_game_id = Some(game.id);
                     self.show_boxscore = true;
+                    self.boxscore_scroll = 0;
                     // Fetch the boxscore now rather than waiting out the
                     // refresh interval.
                     return Some(Action::Refresh);
@@ -302,6 +465,28 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// Moves the current date and asks for the data that goes with it.
+    fn shift_date(&mut self, days: i64) -> Option<Action> {
+        self.current_date += chrono::Duration::days(days);
+        self.reset_scroll();
+        Some(Action::Refresh)
+    }
+
+    /// One screenful of rows, as last rendered.
+    fn page(&self) -> usize {
+        self.viewport_rows.get().max(1)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let max = self.row_count();
+        if max == 0 {
+            return;
+        }
+        let scroll = self.scroll_mut();
+        let target = (*scroll as isize + delta).clamp(0, max as isize - 1);
+        *scroll = target as usize;
     }
 
     /// Number of selectable rows on the active tab.
@@ -313,7 +498,7 @@ impl App {
                 .schedule
                 .as_ref()
                 .map_or(0, |s| s.game_week.iter().map(|d| d.games.len()).sum()),
-            Tab::Leaders => self.current_leaders().len(),
+            Tab::Leaders | Tab::Goalies => self.leader_entries().len(),
         }
     }
 
@@ -323,6 +508,7 @@ impl App {
             Tab::Standings => &mut self.standings_scroll,
             Tab::Schedule => &mut self.schedule_scroll,
             Tab::Leaders => &mut self.leaders_scroll,
+            Tab::Goalies => &mut self.goalies_scroll,
         }
     }
 
@@ -335,19 +521,29 @@ impl App {
     /// returns a different number of games.
     fn clamp_scroll(&mut self) {
         // Lengths are read up front: each getter borrows `self` immutably.
+        let leaders = self
+            .leaders
+            .get(self.leader_category.api_key())
+            .map_or(0, Vec::len);
+        let goalies = self
+            .goalies
+            .get(self.goalie_category.api_key())
+            .map_or(0, Vec::len);
         let lengths = [
             self.scores.as_ref().map_or(0, |s| s.games.len()),
             self.filtered_standings().len(),
             self.schedule
                 .as_ref()
                 .map_or(0, |s| s.game_week.iter().map(|d| d.games.len()).sum()),
-            self.current_leaders().len(),
+            leaders,
+            goalies,
         ];
         let scrolls = [
             &mut self.scores_scroll,
             &mut self.standings_scroll,
             &mut self.schedule_scroll,
             &mut self.leaders_scroll,
+            &mut self.goalies_scroll,
         ];
         for (scroll, len) in scrolls.into_iter().zip(lengths) {
             *scroll = (*scroll).min(len.saturating_sub(1));
@@ -377,21 +573,26 @@ impl App {
             StandingsFilter::League => {
                 rows.sort_by_key(|s| s.league_sequence.unwrap_or(u32::MAX));
             }
+            // `sort_by`, not `sort_by_key`: the key is evaluated on every
+            // comparison, so returning an owned String there allocated
+            // hundreds of times per sort, and this runs on every frame.
             StandingsFilter::Conference => {
                 // Eastern before Western, each in conference order.
-                rows.sort_by_key(|s| {
-                    (
-                        s.conference_name.clone(),
-                        s.conference_sequence.unwrap_or(u32::MAX),
-                    )
+                rows.sort_by(|a, b| {
+                    a.conference_name.cmp(&b.conference_name).then_with(|| {
+                        a.conference_sequence
+                            .unwrap_or(u32::MAX)
+                            .cmp(&b.conference_sequence.unwrap_or(u32::MAX))
+                    })
                 });
             }
             StandingsFilter::Division => {
-                rows.sort_by_key(|s| {
-                    (
-                        s.division_name.clone(),
-                        s.division_sequence.unwrap_or(u32::MAX),
-                    )
+                rows.sort_by(|a, b| {
+                    a.division_name.cmp(&b.division_name).then_with(|| {
+                        a.division_sequence
+                            .unwrap_or(u32::MAX)
+                            .cmp(&b.division_sequence.unwrap_or(u32::MAX))
+                    })
                 });
             }
         }
@@ -407,10 +608,28 @@ impl App {
         }
     }
 
-    pub fn current_leaders(&self) -> &[StatLeader] {
-        self.leaders
-            .get(self.leader_category.api_key())
-            .map_or(&[], |v| v.as_slice())
+    /// The leaderboard for whichever leaders tab is active. Skaters and
+    /// goalies share one table; only the source and the value format differ.
+    pub fn leader_entries(&self) -> &[StatLeader] {
+        let (table, key) = match self.active_tab {
+            Tab::Goalies => (&self.goalies, self.goalie_category.api_key()),
+            _ => (&self.leaders, self.leader_category.api_key()),
+        };
+        table.get(key).map_or(&[], |v| v.as_slice())
+    }
+
+    pub fn leader_category_label(&self) -> &'static str {
+        match self.active_tab {
+            Tab::Goalies => self.goalie_category.as_str(),
+            _ => self.leader_category.as_str(),
+        }
+    }
+
+    pub fn format_leader_value(&self, value: f64) -> String {
+        match self.active_tab {
+            Tab::Goalies => self.goalie_category.format_value(value),
+            _ => self.leader_category.format_value(value),
+        }
     }
 
     pub fn is_favorite_team(&self, abbrev: &str) -> bool {
@@ -447,10 +666,34 @@ impl App {
 
     /// Starts a fetch in the background and returns immediately, so the UI
     /// keeps responding to keys while the network call is in flight.
-    pub fn spawn_fetch(&mut self, tx: UnboundedSender<Action>) {
+    /// Decides which feeds are stale enough to be worth requesting.
+    fn plan(&self, force: bool) -> Plan {
+        let stale = |at: Option<Instant>| match at {
+            None => true,
+            Some(at) => at.elapsed() >= SLOW_INTERVAL,
+        };
+        Plan {
+            // Always: this is the live data, and it is keyed by date.
+            scores: true,
+            standings: force || self.standings.is_none() || stale(self.standings_at),
+            // The schedule is a week around `current_date`, so a date change
+            // invalidates it regardless of age.
+            schedule: force
+                || self.schedule_for != Some(self.current_date)
+                || stale(self.schedule_at),
+            leaders: force || stale(self.leaders_at),
+        }
+    }
+
+    /// Starts a fetch in the background and returns immediately, so the UI
+    /// keeps responding to keys while the network call is in flight.
+    ///
+    /// `force` bypasses the freshness check, for an explicit refresh.
+    pub fn spawn_fetch(&mut self, tx: UnboundedSender<Action>, force: bool) {
         self.request_id += 1;
         self.loading = true;
 
+        let plan = self.plan(force);
         let request_id = self.request_id;
         let client = self.client.clone();
         let date = self.date_str();
@@ -459,12 +702,31 @@ impl App {
             .then_some(self.selected_game_id)
             .flatten();
 
+        // Remember what this request covers, so a later plan sees it as fresh.
+        if plan.schedule {
+            self.schedule_for = Some(self.current_date);
+        }
+
         tokio::spawn(async move {
-            let (scores, standings, schedule, leaders) = tokio::join!(
-                client.get_scores(&date),
-                client.get_standings(),
-                client.get_schedule(&date),
-                client.get_leaders(LEADER_LIMIT),
+            // Each arm resolves to a different payload type, so the
+            // error mapping is written out rather than shared via a closure.
+            macro_rules! feed {
+                ($want:expr, $call:expr) => {
+                    async {
+                        if $want {
+                            Some($call.await.map_err(|e| e.to_string()))
+                        } else {
+                            None
+                        }
+                    }
+                };
+            }
+            let (scores, standings, schedule, leaders, goalies) = tokio::join!(
+                feed!(plan.scores, client.get_scores(&date)),
+                feed!(plan.standings, client.get_standings()),
+                feed!(plan.schedule, client.get_schedule(&date)),
+                feed!(plan.leaders, client.get_skater_leaders(LEADER_LIMIT)),
+                feed!(plan.leaders, client.get_goalie_leaders(LEADER_LIMIT)),
             );
             let boxscore = match boxscore_id {
                 Some(id) => Some(client.get_boxscore(id).await.map_err(|e| e.to_string())),
@@ -472,10 +734,11 @@ impl App {
             };
             let _ = tx.send(Action::Fetched(Box::new(Fetched {
                 request_id,
-                scores: scores.map_err(|e| e.to_string()),
-                standings: standings.map_err(|e| e.to_string()),
-                schedule: schedule.map_err(|e| e.to_string()),
-                leaders: leaders.map_err(|e| e.to_string()),
+                scores,
+                standings,
+                schedule,
+                leaders,
+                goalies,
                 boxscore,
             })));
         });
@@ -492,22 +755,37 @@ impl App {
 
         let mut errors = Vec::new();
         // A closure would be monomorphic over one payload type; each slot
-        // holds a different one.
+        // holds a different one. `None` means the feed was not requested.
         macro_rules! take {
-            ($slot:expr, $result:expr) => {
+            ($slot:expr, $result:expr, $stamp:expr) => {
                 match $result {
-                    Ok(value) => $slot = Some(value),
-                    Err(e) => errors.push(e),
+                    Some(Ok(value)) => {
+                        $slot = Some(value);
+                        $stamp = Some(Instant::now());
+                    }
+                    Some(Err(e)) => errors.push(e),
+                    None => {}
                 }
             };
         }
-        take!(self.scores, fetched.scores);
-        take!(self.standings, fetched.standings);
-        take!(self.schedule, fetched.schedule);
+        let mut ignored = None;
+        take!(self.scores, fetched.scores, ignored);
+        take!(self.standings, fetched.standings, self.standings_at);
+        take!(self.schedule, fetched.schedule, self.schedule_at);
+        let _ = ignored;
 
         match fetched.leaders {
-            Ok(leaders) => self.leaders = leaders,
-            Err(e) => errors.push(e),
+            Some(Ok(leaders)) => {
+                self.leaders = leaders;
+                self.leaders_at = Some(Instant::now());
+            }
+            Some(Err(e)) => errors.push(e),
+            None => {}
+        }
+        match fetched.goalies {
+            Some(Ok(goalies)) => self.goalies = goalies,
+            Some(Err(e)) => errors.push(e),
+            None => {}
         }
         match fetched.boxscore {
             Some(Ok(boxscore)) => self.boxscore = Some(boxscore),
@@ -651,12 +929,13 @@ mod tests {
         app.request_id = 7;
         let stale = Fetched {
             request_id: 6,
-            scores: Ok(ScoreResponse {
+            scores: Some(Ok(ScoreResponse {
                 games: vec![game(1, ("TOR", 9), ("MTL", 0))],
-            }),
-            standings: Err("x".into()),
-            schedule: Err("x".into()),
-            leaders: Err("x".into()),
+            })),
+            standings: None,
+            schedule: None,
+            leaders: None,
+            goalies: None,
             boxscore: None,
         };
         app.apply_fetch(stale);
@@ -672,5 +951,109 @@ mod tests {
         assert!(matches!(action, Some(Action::Refresh)));
         assert_eq!(app.current_date, start + chrono::Duration::days(1));
         assert_eq!(app.scores_scroll, 0);
+    }
+    #[test]
+    fn goalie_values_use_hockey_conventions() {
+        assert_eq!(GoalieCategory::SavePercentage.format_value(0.921), ".921");
+        assert_eq!(
+            GoalieCategory::GoalsAgainstAverage.format_value(2.1534),
+            "2.15"
+        );
+        assert_eq!(GoalieCategory::Wins.format_value(39.0), "39");
+    }
+
+    #[test]
+    fn tabs_cycle_with_tab_and_shift_tab() {
+        let mut app = app();
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.active_tab, Tab::Goalies, "Shift-Tab wraps backwards");
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.active_tab, Tab::Scores);
+    }
+
+    #[test]
+    fn esc_closes_overlays_but_does_not_quit() {
+        let mut app = app();
+        app.show_help = true;
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.show_help);
+        assert!(!app.should_quit, "Esc must not quit from an overlay");
+
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.should_quit, "Esc is not a quit key at the top level");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_inside_an_overlay() {
+        let mut app = app();
+        app.show_boxscore = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn page_keys_move_by_a_screenful_and_stop_at_the_ends() {
+        let mut app = app();
+        app.scores = Some(ScoreResponse {
+            games: (0..30).map(|i| game(i, ("TOR", 0), ("MTL", 0))).collect(),
+        });
+        app.viewport_rows.set(10);
+
+        app.handle_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.scores_scroll, 10);
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.scores_scroll, 5, "Ctrl-U is a half page");
+
+        app.handle_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.scores_scroll, 0, "clamped at the top");
+        for _ in 0..10 {
+            app.handle_key(KeyEvent::from(KeyCode::PageDown));
+        }
+        assert_eq!(app.scores_scroll, 29, "clamped at the bottom");
+    }
+
+    #[test]
+    fn t_returns_to_today_from_a_browsed_date() {
+        let mut app = app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('H')));
+        assert_eq!(
+            app.current_date,
+            Local::now().date_naive() - chrono::Duration::days(7)
+        );
+
+        let action = app.handle_key(KeyEvent::from(KeyCode::Char('t')));
+        assert!(matches!(action, Some(Action::Refresh)));
+        assert!(app.is_today());
+    }
+
+    #[test]
+    fn fresh_feeds_are_not_refetched_but_a_forced_refresh_takes_everything() {
+        let mut app = app();
+        app.standings_at = Some(Instant::now());
+        app.leaders_at = Some(Instant::now());
+        app.schedule_at = Some(Instant::now());
+        app.schedule_for = Some(app.current_date);
+        app.standings = Some(StandingsResponse { standings: vec![] });
+
+        let plan = app.plan(false);
+        assert!(plan.scores, "scores are always live");
+        assert!(!plan.standings && !plan.leaders && !plan.schedule);
+
+        let forced = app.plan(true);
+        assert!(forced.standings && forced.leaders && forced.schedule);
+    }
+
+    #[test]
+    fn changing_date_invalidates_the_cached_schedule() {
+        let mut app = app();
+        app.schedule_at = Some(Instant::now());
+        app.schedule_for = Some(app.current_date);
+        assert!(!app.plan(false).schedule);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('l')));
+        assert!(app.plan(false).schedule, "a new date needs a new game week");
     }
 }

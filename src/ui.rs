@@ -32,16 +32,23 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(area);
 
     draw_tabs(f, app, chunks[0]);
+    // Page keys move by a screenful, so the app needs to know how tall the
+    // content pane actually is. Minus two for the panel's top and bottom border.
+    app.viewport_rows
+        .set(chunks[1].height.saturating_sub(2).max(1) as usize);
     match app.active_tab {
         Tab::Scores => draw_scores(f, app, chunks[1]),
         Tab::Standings => draw_standings(f, app, chunks[1]),
         Tab::Schedule => draw_schedule(f, app, chunks[1]),
-        Tab::Leaders => draw_leaders(f, app, chunks[1]),
+        Tab::Leaders | Tab::Goalies => draw_leaders(f, app, chunks[1]),
     }
     draw_status(f, app, chunks[2]);
 
     if app.show_boxscore {
         draw_boxscore_overlay(f, app, area);
+    }
+    if app.show_help {
+        draw_help_overlay(f, area);
     }
 }
 
@@ -160,7 +167,7 @@ fn draw_scores(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::new()
             };
-            Line::from(spans).style(base)
+            pad_to_width(Line::from(spans).style(base), inner.width)
         })
         .collect();
 
@@ -291,7 +298,7 @@ fn draw_standings(f: &mut Frame, app: &App, area: Rect) {
         rows,
         [
             Constraint::Length(3),
-            Constraint::Min(20),
+            Constraint::Max(30),
             Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(4),
@@ -301,10 +308,11 @@ fn draw_standings(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(5),
             Constraint::Length(5),
             Constraint::Length(6),
+            Constraint::Min(0),
         ],
     )
     .header(header_row(&[
-        "#", "Team", "GP", "W", "L", "OT", "PTS", "GF", "GA", "+/-", "STRK",
+        "#", "Team", "GP", "W", "L", "OT", "PTS", "GF", "GA", "+/-", "STRK", "",
     ]))
     .row_highlight_style(SELECTED_STYLE)
     .highlight_spacing(HighlightSpacing::Always);
@@ -358,7 +366,7 @@ fn draw_schedule(f: &mut Frame, app: &App, area: Rect) {
                 }
             };
 
-            lines.push(
+            lines.push(pad_to_width(
                 Line::from(vec![
                     Span::raw(" "),
                     Span::raw(if selected { "\u{25B8}" } else { " " }),
@@ -375,7 +383,8 @@ fn draw_schedule(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::new()
                 }),
-            );
+                inner.width,
+            ));
             game_idx += 1;
         }
         lines.push(Line::raw(""));
@@ -391,13 +400,17 @@ fn draw_schedule(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_leaders(f: &mut Frame, app: &App, area: Rect) {
     let block = panel(
-        format!(" Stat Leaders [{}] ", app.leader_category.as_str()),
+        format!(
+            " {} Leaders [{}] ",
+            leaders_noun(app),
+            app.leader_category_label()
+        ),
         " \u{25C4} h  |  l \u{25BA}  |  j/k \u{2195} ",
     );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let entries = app.current_leaders();
+    let entries = app.leader_entries();
     if entries.is_empty() {
         let text = if app.last_updated.is_some() {
             "No leaders for this category."
@@ -419,7 +432,7 @@ fn draw_leaders(f: &mut Frame, app: &App, area: Rect) {
                 e.position.clone().unwrap_or_default(),
                 e.team_abbrev.clone().unwrap_or_default(),
                 e.value
-                    .map(|v| app.leader_category.format_value(v))
+                    .map(|v| app.format_leader_value(v))
                     .unwrap_or_default(),
             ])
         })
@@ -429,18 +442,45 @@ fn draw_leaders(f: &mut Frame, app: &App, area: Rect) {
         rows,
         [
             Constraint::Length(3),
-            Constraint::Min(20),
+            Constraint::Max(26),
             Constraint::Length(4),
             Constraint::Length(5),
             Constraint::Length(8),
+            // Absorbs leftover width so the stat columns stay beside the
+            // name instead of being pushed to the far edge.
+            Constraint::Min(0),
         ],
     )
-    .header(header_row(&["#", "Player", "Pos", "Team", "Value"]))
+    .header(header_row(&["#", "Player", "Pos", "Team", "Value", ""]))
     .row_highlight_style(SELECTED_STYLE)
     .highlight_spacing(HighlightSpacing::Always);
 
-    let mut state = TableState::new().with_selected(Some(app.leaders_scroll));
+    let selected = if app.active_tab == Tab::Goalies {
+        app.goalies_scroll
+    } else {
+        app.leaders_scroll
+    };
+    let mut state = TableState::new().with_selected(Some(selected));
     f.render_stateful_widget(table, inner, &mut state);
+}
+
+/// Pads a line with spaces so a selected row's background spans the pane
+/// instead of stopping at the end of the text.
+fn pad_to_width(line: Line<'_>, width: u16) -> Line<'_> {
+    let used = line.width();
+    let mut line = line;
+    if used < width as usize {
+        line.push_span(Span::raw(" ".repeat(width as usize - used)));
+    }
+    line
+}
+
+fn leaders_noun(app: &App) -> &'static str {
+    if app.active_tab == Tab::Goalies {
+        "Goalie"
+    } else {
+        "Skater"
+    }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -468,7 +508,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Red),
         ));
     }
-    spans.push(Span::styled("[q]uit [r]efresh [1-4]tabs", MUTED));
+    spans.push(Span::styled("[?]help [r]efresh [q]uit", MUTED));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -616,9 +656,28 @@ fn draw_boxscore_overlay(f: &mut Frame, app: &App, area: Rect) {
         goal_lines.push(Line::styled("   No goals.", MUTED));
     }
 
-    f.render_widget(Paragraph::new(goal_lines), chunks[1]);
+    // A high-scoring game produces more goals than fit, so the list scrolls.
+    // The offset is clamped here rather than in the key handler, which has no
+    // idea how tall the overlay is.
+    let viewport = chunks[1].height as usize;
+    let overflow = goal_lines.len().saturating_sub(viewport);
+    let offset = app.boxscore_scroll.min(overflow);
     f.render_widget(
-        Paragraph::new(Line::styled("[Esc] Close", MUTED)).alignment(Alignment::Center),
+        Paragraph::new(goal_lines).scroll((offset as u16, 0)),
+        chunks[1],
+    );
+
+    let footer = if overflow > 0 {
+        format!(
+            "[j/k] Scroll {}/{}  \u{2022}  [Esc] Close",
+            offset + 1,
+            overflow + 1
+        )
+    } else {
+        "[Esc] Close".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::styled(footer, MUTED)).alignment(Alignment::Center),
         chunks[2],
     );
 }
@@ -633,6 +692,68 @@ fn initial(name: &Option<crate::api::models::NameField>) -> String {
 /// The value of an optional `{ "default": ... }` field, or "".
 fn text(name: &Option<crate::api::models::NameField>) -> &str {
     name.as_ref().map(|n| n.default.as_str()).unwrap_or("")
+}
+
+/// The keymap, reachable with `?` from anywhere. Without this the only
+/// discoverable hints are the cramped ones on the panel borders.
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    const KEYS: &[(&str, &str)] = &[
+        ("1 - 5", "Jump to a tab"),
+        ("Tab / Shift-Tab", "Cycle tabs"),
+        ("j / k, Down / Up", "Move the selection"),
+        ("Ctrl-D / Ctrl-U", "Half page down / up"),
+        ("PgDn / PgUp", "Full page down / up"),
+        ("g / G, Home / End", "First / last row"),
+        (
+            "h / l, Left / Right",
+            "Previous / next day, or cycle category",
+        ),
+        ("H / L", "Jump back / forward one week"),
+        ("t", "Back to today"),
+        ("Enter", "Open the boxscore (Scores tab)"),
+        ("r", "Refresh everything now"),
+        ("?", "Toggle this help"),
+        ("Esc", "Close an overlay"),
+        ("q / Ctrl-C", "Quit"),
+    ];
+
+    // Two rows of chrome: the top and bottom border.
+    let width = 62.min(area.width.saturating_sub(4));
+    let height = (KEYS.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let overlay = centered_size(width, height, area);
+    f.render_widget(Clear, overlay);
+
+    let block = Block::default()
+        .title(" Keys ")
+        .title_alignment(Alignment::Center)
+        .title_bottom(" any key to close ")
+        .borders(Borders::ALL)
+        .border_style(HEADING);
+    let inner = block.inner(overlay);
+    f.render_widget(block, overlay);
+
+    let lines: Vec<Line> = KEYS
+        .iter()
+        .map(|(key, description)| {
+            Line::from(vec![
+                Span::styled(format!(" {key:<20}"), FAVORITE),
+                Span::raw(*description),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A centred rect of an absolute size, clamped to the area.
+fn centered_size(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

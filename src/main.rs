@@ -18,10 +18,10 @@ struct Cli {
     #[arg(short, long)]
     team: Option<String>,
 
-    /// Starting tab (1=Scores, 2=Standings, 3=Schedule, 4=Leaders)
+    /// Starting tab (1=Scores, 2=Standings, 3=Schedule, 4=Skaters, 5=Goalies)
     ///
     /// No short form: `-t` belongs to `--team`.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=5))]
     tab: u8,
 }
 
