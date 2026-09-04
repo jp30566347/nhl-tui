@@ -1,8 +1,19 @@
 # nhl-tui
 
+[jp30566347.github.io/nhl-tui](https://jp30566347.github.io/nhl-tui)
+
 NHL scores, standings, schedule, and leaders in your terminal.
 
+![A night's scores](docs/screenshot.png)
+
 ## Installation
+
+```sh
+curl -fsSL https://jp30566347.github.io/nhl-tui/install.sh | sh
+```
+
+Drops a single binary in `~/.local/bin` after verifying its checksum. On Arch
+and Omarchy, `makepkg -si` in a clone builds a real package instead.
 
 ### Homebrew (macOS)
 
@@ -20,7 +31,7 @@ Grab the latest binary for your platform from [GitHub Releases](https://github.c
 | macOS (Intel) | `nhl-tui-x86_64-apple-darwin.tar.gz` |
 | Linux (x86_64) | `nhl-tui-x86_64-unknown-linux-musl.tar.gz` |
 | Linux (ARM64) | `nhl-tui-aarch64-unknown-linux-musl.tar.gz` |
-| Windows | `nhl-tui-x86_64-pc-windows-msvc.zip` |
+| Windows (untested) | `nhl-tui-x86_64-pc-windows-msvc.zip` |
 
 ### Build from source
 
