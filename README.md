@@ -1,3 +1,8 @@
+> **This repository is archived.** nhl-tui now lives in
+> [jp30566347/tui](https://github.com/jp30566347/tui), alongside macro-tui, and
+> releases from there. Install with
+> `curl -fsSL https://jp30566347.github.io/tui/nhl-tui/install.sh | sh`.
+
 # nhl-tui
 
 [jp30566347.github.io/nhl-tui](https://jp30566347.github.io/nhl-tui)
